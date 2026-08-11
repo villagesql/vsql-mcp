@@ -1,0 +1,267 @@
+# vsql_mcp — Model Context Protocol server over Streamable HTTP.
+#
+# The extension serves MCP on an HTTP listener owned by a background worker.
+# This suite drives that listener with a small Python client and asserts the
+# protocol, the six tools, the guardrails, auth, session lifecycle, and the
+# status counters. The listener binds an OS-assigned port (port = 0) so the
+# suite is safe under --parallel; the actual port is read back from the
+# vsql_mcp.http_port status variable.
+
+INSTALL EXTENSION vsql_mcp;
+
+# A dedicated loopback account the extension runs tool queries as. Broad SELECT
+# so the guardrails — not privilege errors — are what reject out-of-scope
+# tables; write grants only on the test schema.
+CREATE USER mcpuser@'127.0.0.1';
+GRANT SELECT ON *.* TO mcpuser@'127.0.0.1';
+GRANT INSERT, UPDATE, DELETE ON mcptest.* TO mcpuser@'127.0.0.1';
+
+CREATE SCHEMA mcptest;
+CREATE TABLE mcptest.t1 (id INT PRIMARY KEY, name VARCHAR(50));
+INSERT INTO mcptest.t1 VALUES (1, 'alpha'), (2, 'beta');
+
+# Point the loopback executor at this MTR server (its port is per-run), then
+# start the listener. The db_url line carries the volatile port, so it is
+# hidden from the result.
+--disable_query_log
+--eval SET GLOBAL vsql_mcp.db_url = CONCAT('mysql://mcpuser@127.0.0.1:', @@port)
+--enable_query_log
+SET GLOBAL vsql_mcp.port = 0;
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+
+# The worker binds on its next wakeup; wait until the port is published.
+let $wait_condition=
+  SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+let $port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port'`;
+
+--write_file $MYSQLTEST_VARDIR/tmp/mcp_driver.py
+import sys, json, urllib.request, urllib.error
+
+PORT = sys.argv[1]
+MODE = sys.argv[2]
+TOKEN = sys.argv[3] if len(sys.argv) > 3 else None
+BASE = "http://127.0.0.1:%s/mcp" % PORT
+
+def call(body, method="POST", headers=None, proto="2025-06-18", origin=None):
+    h = {"Content-Type": "application/json",
+         "Accept": "application/json, text/event-stream"}
+    if proto:
+        h["MCP-Protocol-Version"] = proto
+    if origin:
+        h["Origin"] = origin
+    if headers:
+        h.update(headers)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(BASE, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req) as r:
+            raw = r.read().decode()
+            sid = r.headers.get("Mcp-Session-Id")
+            return r.status, (json.loads(raw) if raw else None), sid
+    except urllib.error.HTTPError as e:
+        return e.code, None, None
+
+def ok(name, cond, detail=""):
+    print("%s: %s%s" % (name, "PASS" if cond else "FAIL", "" if cond else " " + detail))
+
+def init():
+    st, body, sid = call({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    return sid
+
+def tool(sid, name, args):
+    st, body, _ = call(
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": name, "arguments": args}},
+        headers={"Mcp-Session-Id": sid})
+    if not body or "result" not in body:
+        return None, "no result"
+    res = body["result"]
+    is_err = res.get("isError", False)
+    text = res["content"][0]["text"]
+    return (text if not is_err else None), (text if is_err else "")
+
+def protocol():
+    st, body, sid = call({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    ok("initialize", st == 200 and sid and body["result"]["serverInfo"]["name"] == "vsql_mcp")
+
+    st, body, _ = call({"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                       headers={"Mcp-Session-Id": sid})
+    names = sorted(t["name"] for t in body["result"]["tools"])
+    ok("tools_list", names == ["describe_table", "explain", "list_schemas",
+                               "list_tables", "query", "write"], str(names))
+
+    text, _ = tool(sid, "query", {"sql": "SELECT name FROM mcptest.t1 ORDER BY id"})
+    rows = json.loads(text)["rows"] if text else []
+    ok("query_select", [r["name"] for r in rows] == ["alpha", "beta"], text or "err")
+
+    _, err = tool(sid, "query", {"sql": "DELETE FROM mcptest.t1"})
+    ok("query_readonly_guardrail", err != "")
+
+    text, _ = tool(sid, "describe_table", {"schema": "mcptest", "table": "t1"})
+    cols = [c["name"] for c in json.loads(text)["columns"]] if text else []
+    ok("describe_table", cols == ["id", "name"], str(cols))
+
+    text, _ = tool(sid, "list_schemas", {})
+    ok("list_schemas", "mcptest" in json.loads(text)["schemas"] if text else False)
+
+    text, _ = tool(sid, "list_tables", {"schema": "mcptest"})
+    tabs = json.loads(text)["tables"] if text else []
+    ok("list_tables", any(t["name"] == "t1" and "row_estimate" in t for t in tabs))
+
+    text, _ = tool(sid, "explain", {"sql": "SELECT * FROM mcptest.t1 WHERE id=1"})
+    ok("explain", text is not None and "query_block" in text)
+
+    st, body, _ = call({"jsonrpc": "2.0", "id": 3, "method": "resources/read",
+                        "params": {"uri": "vsql://mcptest/t1"}},
+                       headers={"Mcp-Session-Id": sid})
+    ddl = body["result"]["contents"][0]["text"]
+    ok("resource_table", "CREATE TABLE" in ddl)
+
+    st, body, _ = call({"jsonrpc": "2.0", "id": 4, "method": "resources/read",
+                        "params": {"uri": "vsql://mcptest"}},
+                       headers={"Mcp-Session-Id": sid})
+    ov = body["result"]["contents"][0]["text"]
+    ok("resource_schema", "t1" in ov)
+
+    st, _, _ = call(None, method="GET", headers={"Mcp-Session-Id": sid})
+    ok("get_405", st == 405, str(st))
+
+    st, _, _ = call({"jsonrpc": "2.0", "id": 5, "method": "initialize", "params": {}},
+                    origin="https://evil.example")
+    ok("origin_remote_403", st == 403, str(st))
+
+    st, s2, _ = call({"jsonrpc": "2.0", "id": 5, "method": "initialize", "params": {}},
+                     origin="http://localhost")
+    ok("origin_localhost_ok", st == 200 and s2 is not None, str(st))
+
+    st, body, _ = call({"jsonrpc": "2.0", "id": 6, "method": "ping"},
+                       headers={"Mcp-Session-Id": sid})
+    ok("ping", st == 200 and "result" in body)
+
+    st, _, _ = call({"jsonrpc": "2.0", "id": 7, "method": "initialize", "params": {}},
+                    proto="1999-01-01")
+    ok("bad_protocol_400", st == 400, str(st))
+
+    big = "x" * (1024 * 1024 + 100)
+    st, _, _ = call({"jsonrpc": "2.0", "id": 8, "method": "initialize", "params": {"pad": big}})
+    ok("body_too_large_413", st == 413, str(st))
+
+def maxrows():
+    sid = init()
+    text, _ = tool(sid, "query", {"sql": "SELECT id FROM mcptest.t1 ORDER BY id"})
+    d = json.loads(text) if text else {}
+    ok("maxrows_truncation", d.get("row_count") == 1 and d.get("truncated") is True, text or "err")
+
+def timeout():
+    sid = init()
+    _, err = tool(sid, "query", {"sql": "SELECT SLEEP(5)"})
+    ok("query_timeout", err != "")
+
+def authfail():
+    st, _, _ = call({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    ok("auth_missing_401", st == 401, str(st))
+    st, _, _ = call({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                    headers={"Authorization": "Bearer wrong"})
+    ok("auth_wrong_401", st == 401, str(st))
+    st, _, sid = call({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                      headers={"Authorization": "Bearer " + TOKEN})
+    ok("auth_ok_200", st == 200 and sid is not None, str(st))
+
+def allowed():
+    sid = init()
+    _, err = tool(sid, "query", {"sql": "SELECT user FROM mysql.user LIMIT 1"})
+    ok("allowed_tables_reject", err != "")
+    text, _ = tool(sid, "query", {"sql": "SELECT id FROM mcptest.t1 WHERE id=1"})
+    ok("allowed_tables_pass", text is not None, err)
+
+def schema():
+    sid = init()
+    text, _ = tool(sid, "list_schemas", {})
+    ok("schema_scope_list", json.loads(text)["schemas"] == ["mcptest"] if text else False, text)
+    _, err = tool(sid, "query", {"sql": "SELECT user FROM mysql.user LIMIT 1"})
+    ok("schema_scope_reject", err != "")
+
+def write():
+    sid = init()
+    text, _ = tool(sid, "write", {"sql": "INSERT INTO mcptest.t1 VALUES (9,'zeta')"})
+    d = json.loads(text) if text else {}
+    ok("write_insert", d.get("affected_rows") == 1, text or "err")
+
+def session():
+    sid = init()
+    st, _, _ = call(None, method="DELETE", headers={"Mcp-Session-Id": sid})
+    ok("session_delete_200", st == 200, str(st))
+    st, body, _ = call({"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                       headers={"Mcp-Session-Id": sid})
+    ok("session_404_after_delete", st == 404, str(st))
+    st, body, _ = call({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    ok("session_missing_400", st == 400, str(st))
+
+{"protocol": protocol, "maxrows": maxrows, "timeout": timeout, "authfail": authfail,
+ "allowed": allowed, "schema": schema, "write": write, "session": session}[MODE]()
+EOF
+
+--echo # --- protocol, tools, resources, transport rules ---
+--exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port protocol
+
+--echo # --- max_rows truncation ---
+SET GLOBAL vsql_mcp.max_rows = 1;
+--exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port maxrows
+SET GLOBAL vsql_mcp.max_rows = 1000;
+
+--echo # --- query_timeout ---
+SET GLOBAL vsql_mcp.query_timeout = 2;
+--exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port timeout
+SET GLOBAL vsql_mcp.query_timeout = 30;
+
+--echo # --- bearer auth ---
+SET GLOBAL vsql_mcp.require_auth = ON;
+SET GLOBAL vsql_mcp.bearer_token = 'secret123';
+--exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port authfail secret123
+SET GLOBAL vsql_mcp.require_auth = OFF;
+
+--echo # --- allowed_tables ---
+SET GLOBAL vsql_mcp.allowed_tables = 'mcptest.t1';
+--exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port allowed
+SET GLOBAL vsql_mcp.allowed_tables = '';
+
+--echo # --- schema scoping ---
+SET GLOBAL vsql_mcp.schema = 'mcptest';
+--exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port schema
+SET GLOBAL vsql_mcp.schema = '';
+
+--echo # --- write tool ---
+SET GLOBAL vsql_mcp.allow_write = ON;
+--exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port write
+SET GLOBAL vsql_mcp.allow_write = OFF;
+
+--echo # --- session lifecycle ---
+--exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port session
+
+--echo # --- status counters advanced past zero ---
+SELECT VARIABLE_VALUE > 0 AS tool_calls_positive
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME = 'vsql_mcp.tool_calls_total';
+SELECT VARIABLE_VALUE > 0 AS rows_returned_positive
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME = 'vsql_mcp.rows_returned_total';
+SELECT VARIABLE_VALUE > 0 AS tool_errors_positive
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME = 'vsql_mcp.tool_errors_total';
+
+# Stopping the listener clears sessions and the published port.
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+let $wait_condition=
+  SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+SELECT VARIABLE_VALUE AS sessions_active
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME = 'vsql_mcp.sessions_active';
+
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_driver.py
+DROP SCHEMA mcptest;
+DROP USER mcpuser@'127.0.0.1';
+UNINSTALL EXTENSION vsql_mcp;

@@ -1,0 +1,84 @@
+INSTALL EXTENSION vsql_mcp;
+CREATE USER mcpuser@'127.0.0.1';
+GRANT SELECT ON *.* TO mcpuser@'127.0.0.1';
+GRANT INSERT, UPDATE, DELETE ON mcptest.* TO mcpuser@'127.0.0.1';
+CREATE SCHEMA mcptest;
+CREATE TABLE mcptest.t1 (id INT PRIMARY KEY, name VARCHAR(50));
+INSERT INTO mcptest.t1 VALUES (1, 'alpha'), (2, 'beta');
+SET GLOBAL vsql_mcp.port = 0;
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+# --- protocol, tools, resources, transport rules ---
+initialize: PASS
+tools_list: PASS
+query_select: PASS
+query_readonly_guardrail: PASS
+describe_table: PASS
+list_schemas: PASS
+list_tables: PASS
+explain: PASS
+resource_table: PASS
+resource_schema: PASS
+get_405: PASS
+origin_remote_403: PASS
+origin_localhost_ok: PASS
+ping: PASS
+bad_protocol_400: PASS
+body_too_large_413: PASS
+# --- max_rows truncation ---
+SET GLOBAL vsql_mcp.max_rows = 1;
+maxrows_truncation: PASS
+SET GLOBAL vsql_mcp.max_rows = 1000;
+# --- query_timeout ---
+SET GLOBAL vsql_mcp.query_timeout = 2;
+query_timeout: PASS
+SET GLOBAL vsql_mcp.query_timeout = 30;
+# --- bearer auth ---
+SET GLOBAL vsql_mcp.require_auth = ON;
+SET GLOBAL vsql_mcp.bearer_token = 'secret123';
+auth_missing_401: PASS
+auth_wrong_401: PASS
+auth_ok_200: PASS
+SET GLOBAL vsql_mcp.require_auth = OFF;
+# --- allowed_tables ---
+SET GLOBAL vsql_mcp.allowed_tables = 'mcptest.t1';
+allowed_tables_reject: PASS
+allowed_tables_pass: PASS
+SET GLOBAL vsql_mcp.allowed_tables = '';
+# --- schema scoping ---
+SET GLOBAL vsql_mcp.schema = 'mcptest';
+schema_scope_list: PASS
+schema_scope_reject: PASS
+SET GLOBAL vsql_mcp.schema = '';
+# --- write tool ---
+SET GLOBAL vsql_mcp.allow_write = ON;
+write_insert: PASS
+SET GLOBAL vsql_mcp.allow_write = OFF;
+# --- session lifecycle ---
+session_delete_200: PASS
+session_404_after_delete: PASS
+session_missing_400: PASS
+# --- status counters advanced past zero ---
+SELECT VARIABLE_VALUE > 0 AS tool_calls_positive
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'vsql_mcp.tool_calls_total';
+tool_calls_positive
+1
+SELECT VARIABLE_VALUE > 0 AS rows_returned_positive
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'vsql_mcp.rows_returned_total';
+rows_returned_positive
+1
+SELECT VARIABLE_VALUE > 0 AS tool_errors_positive
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'vsql_mcp.tool_errors_total';
+tool_errors_positive
+1
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+SELECT VARIABLE_VALUE AS sessions_active
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'vsql_mcp.sessions_active';
+sessions_active
+0
+DROP SCHEMA mcptest;
+DROP USER mcpuser@'127.0.0.1';
+UNINSTALL EXTENSION vsql_mcp;
