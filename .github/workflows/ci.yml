@@ -13,6 +13,19 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # Cargo.toml depends on ../vsql-rust-sdk by path, because the published
+      # villagesql crate predates the preview capabilities this extension uses
+      # (see AGENTS.md). Clone it where that path expects it. Tracking the SDK's
+      # main matches how the extension is developed locally, so a breaking SDK
+      # change shows up here rather than on someone's machine. When a published
+      # crate ships those capabilities, this step and the path dependency go
+      # away together.
+      - name: Check out the Rust SDK beside this repo
+        run: |
+          git clone --depth 1 https://github.com/villagesql/vsql-rust-sdk.git \
+            "$(dirname "$GITHUB_WORKSPACE")/vsql-rust-sdk"
+
       - uses: villagesql/extension-actions/rust@main
         with:
           extension-name: vsql_mcp
