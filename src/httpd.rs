@@ -67,11 +67,92 @@ fn bound_port(server: &Server) -> i64 {
 fn tls_server(cfg: &ListenConfig) -> Result<Server, String> {
     let certificate = std::fs::read(&cfg.ssl_cert).map_err(|e| format!("read ssl_cert: {e}"))?;
     let private_key = std::fs::read(&cfg.ssl_key).map_err(|e| format!("read ssl_key: {e}"))?;
+    // The listener binds happily on a certificate and key that do not belong
+    // together, and then fails every handshake — publishing a port that reads
+    // as healthy and serves nothing. Checking first turns that into the same
+    // visible failure as an unreadable file.
+    if let Some(reason) = tls_material_mismatch(&certificate, &private_key) {
+        return Err(reason);
+    }
     let config = tiny_http::SslConfig {
         certificate,
         private_key,
     };
     Server::https(format!("127.0.0.1:{}", cfg.ssl_port), config).map_err(|e| e.to_string())
+}
+
+/// The reason the certificate and key do not belong together, when that can be
+/// established. `None` means either they correspond or this check cannot tell.
+///
+/// Only a PROVEN mismatch refuses the listener. Anything this cannot parse is
+/// passed through to `tiny_http`, which reads the same PEM with the same
+/// library: a check that refused material the listener would have accepted
+/// would be a worse bug than the one it is here to prevent.
+///
+/// The test is a signing round trip rather than a comparison of key fields. It
+/// needs no ASN.1 parsing of our own and it fails for precisely the reason a
+/// handshake would.
+fn tls_material_mismatch(cert_pem: &[u8], key_pem: &[u8]) -> Option<String> {
+    use rustls::SignatureScheme;
+
+    let cert_der = first_certificate(cert_pem)?;
+    let key_der = first_private_key(key_pem)?;
+    let signing_key = rustls::sign::any_supported_type(&rustls::PrivateKey(key_der)).ok()?;
+    let cert = webpki::EndEntityCert::try_from(cert_der.as_slice()).ok()?;
+
+    // Each scheme paired with the webpki algorithm that verifies it, so the
+    // signature is checked with the algorithm that produced it.
+    let candidates: &[(SignatureScheme, &webpki::SignatureAlgorithm)] = &[
+        (SignatureScheme::ECDSA_NISTP256_SHA256, &webpki::ECDSA_P256_SHA256),
+        (SignatureScheme::ECDSA_NISTP384_SHA384, &webpki::ECDSA_P384_SHA384),
+        (SignatureScheme::ED25519, &webpki::ED25519),
+        (SignatureScheme::RSA_PKCS1_SHA256, &webpki::RSA_PKCS1_2048_8192_SHA256),
+        (SignatureScheme::RSA_PKCS1_SHA384, &webpki::RSA_PKCS1_2048_8192_SHA384),
+        (SignatureScheme::RSA_PKCS1_SHA512, &webpki::RSA_PKCS1_2048_8192_SHA512),
+    ];
+    const PROBE: &[u8] = b"vsql_mcp tls material check";
+
+    for (scheme, algorithm) in candidates {
+        let Some(signer) = signing_key.choose_scheme(&[*scheme]) else {
+            continue;
+        };
+        let Ok(signature) = signer.sign(PROBE) else {
+            continue;
+        };
+        return match cert.verify_signature(algorithm, PROBE, &signature) {
+            Ok(()) => None,
+            Err(_) => Some(
+                "ssl_key does not match ssl_cert: the certificate attests to a \
+                 different public key, so every TLS handshake would fail"
+                    .to_owned(),
+            ),
+        };
+    }
+    // No scheme in common to test with — not a verdict.
+    None
+}
+
+fn first_certificate(pem: &[u8]) -> Option<Vec<u8>> {
+    let mut reader = std::io::BufReader::new(pem);
+    rustls_pemfile::certs(&mut reader).ok()?.into_iter().next()
+}
+
+fn first_private_key(pem: &[u8]) -> Option<Vec<u8>> {
+    // PKCS#8 first, then PKCS#1, which is what this PEM library recognises and
+    // therefore all the listener itself can use.
+    for parse in [
+        rustls_pemfile::pkcs8_private_keys
+            as fn(&mut dyn std::io::BufRead) -> std::io::Result<Vec<Vec<u8>>>,
+        rustls_pemfile::rsa_private_keys,
+    ] {
+        let mut reader = std::io::BufReader::new(pem);
+        if let Ok(mut keys) = parse(&mut reader) {
+            if !keys.is_empty() {
+                return Some(keys.remove(0));
+            }
+        }
+    }
+    None
 }
 
 /// Drop all listeners and forget every session.

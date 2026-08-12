@@ -60,22 +60,9 @@ def guardrails_over_https():
     C.ok("https_get_405", st == 405, st)
 
 
-def https_unusable():
-    """The listener is bound but its certificate and key do not correspond.
-    Record what a client actually gets."""
-    try:
-        sid = C.init()
-        C.ok("https_bound_but_handshake_fails", sid is None,
-             "handshake succeeded, session %s" % sid)
-    except Exception as e:                    # noqa: BLE001 - the point is which
-        C.ok("https_bound_but_handshake_fails", True)
-        print("handshake_error_kind: %s" % type(e).__name__)
-
-
 {"https_session": lambda: session_over("https"),
  "http_session": lambda: session_over("http"),
- "https_guardrails": guardrails_over_https,
- "https_unusable": https_unusable}[MODE]()
+ "https_guardrails": guardrails_over_https}[MODE]()
 EOF
 
 --echo # --- generate a self-signed certificate for this run ---
@@ -160,15 +147,11 @@ let $wait_condition=
   SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
    WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
 --source include/wait_condition.inc
---echo # DEFECT: the listener binds anyway. The certificate and key are never
---echo # checked against each other, so https_port publishes a port that cannot
---echo # complete a handshake — a broken endpoint that monitoring reads as
---echo # healthy. Pinned here; see the findings.
-let $mcp_ssl_port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.https_port'`;
---disable_query_log
---eval SELECT $mcp_ssl_port > 0 AS known_https_binds_with_mismatched_key
---enable_query_log
---exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_tls.py $MYSQLTEST_VARDIR/tmp $mcp_ssl_port https_unusable
+--echo # The pair is checked before the listener binds, so this fails the same
+--echo # visible way an unreadable file does: no TLS port. Binding anyway would
+--echo # publish a port that reads as healthy and cannot complete a handshake.
+SELECT VARIABLE_VALUE AS https_port_with_mismatched_key
+  FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.https_port';
 --echo # the plain listener is unaffected by the TLS failure
 let $mcp_port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port'`;
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_tls.py $MYSQLTEST_VARDIR/tmp $mcp_port http_session

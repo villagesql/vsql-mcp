@@ -991,10 +991,13 @@ name = "vsql_mcp"
 version = "0.0.2"
 dependencies = [
  "mysql",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tiny_http",
  "villagesql",
+ "webpki",
 ]
 
 [[package]]

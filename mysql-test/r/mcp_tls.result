@@ -67,14 +67,13 @@ http_session_delete: PASS
 # together, which is the mistake an operator actually makes.
 SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
 SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
-# DEFECT: the listener binds anyway. The certificate and key are never
-# checked against each other, so https_port publishes a port that cannot
-# complete a handshake — a broken endpoint that monitoring reads as
-# healthy. Pinned here; see the findings.
-known_https_binds_with_mismatched_key
-1
-https_bound_but_handshake_fails: PASS
-handshake_error_kind: URLError
+# The pair is checked before the listener binds, so this fails the same
+# visible way an unreadable file does: no TLS port. Binding anyway would
+# publish a port that reads as healthy and cannot complete a handshake.
+SELECT VARIABLE_VALUE AS https_port_with_mismatched_key
+FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.https_port';
+https_port_with_mismatched_key
+0
 # the plain listener is unaffected by the TLS failure
 http_session_issued: PASS
 http_tools_list: PASS
