@@ -19,7 +19,7 @@ const DEFAULT_PORT: i64 = 3100;
 const DEFAULT_SSL_PORT: i64 = 3143;
 const DEFAULT_MAX_ROWS: i64 = 1000;
 const DEFAULT_QUERY_TIMEOUT: i64 = 30;
-const DEFAULT_SCHEMA_TTL: i64 = 60;
+const DEFAULT_SESSION_TTL: i64 = 1800;
 
 /// Every `vsql_mcp.*` variable. `vsql_mcp_enabled` is NOT here — the
 /// `thread_worker` capability owns that control variable.
@@ -35,7 +35,7 @@ static SPECS: &[SysVarSpec] = &[
     SysVarSpec::Str { name: c"allowed_tables", comment: c"Comma-separated table allowlist; empty = all", default: c"", on_change: None },
     SysVarSpec::Int { name: c"max_rows", comment: c"Row cap per query result", default: DEFAULT_MAX_ROWS, min: 1, max: 1_000_000, on_change: None },
     SysVarSpec::Int { name: c"query_timeout", comment: c"Per-tool-call statement timeout (seconds)", default: DEFAULT_QUERY_TIMEOUT, min: 1, max: 3600, on_change: None },
-    SysVarSpec::Int { name: c"schema_ttl", comment: c"Schema cache TTL (seconds)", default: DEFAULT_SCHEMA_TTL, min: 0, max: 86400, on_change: None },
+    SysVarSpec::Int { name: c"session_ttl", comment: c"Idle MCP session lifetime (seconds)", default: DEFAULT_SESSION_TTL, min: 1, max: 86400, on_change: None },
     SysVarSpec::Str { name: c"db_url", comment: c"Loopback DSN the extension runs tool queries through (mysql://user:pass@host:port)", default: c"", on_change: None },
 ];
 
@@ -163,4 +163,10 @@ pub fn schema_setting() -> String {
 }
 pub fn port_settings() -> (i64, i64) {
     (get_int(c"port", DEFAULT_PORT), get_int(c"ssl_port", DEFAULT_SSL_PORT))
+}
+
+/// How long an idle session stays valid. Read per use rather than cached so a
+/// change applies to the next request, like every other setting here.
+pub fn session_ttl() -> std::time::Duration {
+    std::time::Duration::from_secs(get_int(c"session_ttl", DEFAULT_SESSION_TTL).max(1) as u64)
 }

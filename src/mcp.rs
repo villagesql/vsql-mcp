@@ -27,9 +27,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// value the spec says to assume when the header is absent, so we accept it too.
 pub const SUPPORTED_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26"];
 
-/// A session with no activity for this long is treated as gone. MCP clients are
-/// supposed to DELETE on exit but often don't, so this bounds the map.
-const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+/// A session with no activity for `vsql_mcp.session_ttl` is treated as gone.
+/// MCP clients are supposed to DELETE on exit but often don't, so this bounds
+/// the map. Read through a function rather than held as a constant so the
+/// setting takes effect on the next request.
+fn session_ttl() -> Duration {
+    crate::config::session_ttl()
+}
 
 static SESSIONS: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -49,8 +53,9 @@ pub fn new_session() -> String {
     let a = seeded_hash(n);
     let b = seeded_hash(n ^ 0x9e37_79b9_7f4a_7c15);
     let id = format!("{a:016x}{b:016x}");
+    let ttl = session_ttl();
     let mut map = lock_sessions();
-    map.retain(|_, created| created.elapsed() < SESSION_TTL);
+    map.retain(|_, created| created.elapsed() < ttl);
     map.insert(id.clone(), Instant::now());
     status::set_sessions_active(map.len() as i64);
     id
@@ -58,9 +63,10 @@ pub fn new_session() -> String {
 
 /// A read-only check: an expired session reads as gone even before eviction.
 pub fn session_exists(id: &str) -> bool {
+    let ttl = session_ttl();
     lock_sessions()
         .get(id)
-        .is_some_and(|created| created.elapsed() < SESSION_TTL)
+        .is_some_and(|created| created.elapsed() < ttl)
 }
 
 /// Remove a session. Returns true if it existed.

@@ -282,17 +282,26 @@ fn check_access(sql: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Res
     if cfg.allowed_tables.is_empty() {
         return Ok(());
     }
-    // SHOW and DESCRIBE cannot be planned, so EXPLAIN below would fail with a
-    // parser error that says nothing about why. Refuse them with the reason and
-    // the tools that do the same job under an allowlist.
-    let verb = guardrails::leading_verb(sql);
-    if matches!(verb.as_str(), "show" | "describe" | "desc") {
-        return Err(format!(
-            "{} cannot be used while vsql_mcp.allowed_tables is set, because it \
-             cannot be planned to check which tables it reads; use the \
-             list_tables and describe_table tools instead",
-            verb.to_uppercase()
-        ));
+    // SHOW and DESCRIBE cannot be planned, so the EXPLAIN below would fail with
+    // a parser error. The forms that name one table can be checked directly;
+    // the rest would enumerate names the allowlist exists to withhold, so they
+    // are refused with the reason and the tools that do the same job.
+    if let Some(target) = guardrails::metadata_target(sql) {
+        return match target {
+            guardrails::MetadataTarget::Table(table) => {
+                if guardrails::table_allowed(&table, &cfg.allowed_tables) {
+                    Ok(())
+                } else {
+                    Err(format!("table '{table}' is not in vsql_mcp.allowed_tables"))
+                }
+            }
+            guardrails::MetadataTarget::NotTableScoped => Err(format!(
+                "{} cannot be used while vsql_mcp.allowed_tables is set, because \
+                 it would list objects the allowlist withholds; use the \
+                 list_tables and describe_table tools instead",
+                guardrails::leading_verb(sql).to_uppercase()
+            )),
+        };
     }
     let plan = explain_json(sql, cfg, exec)?;
     let mut tables = guardrails::tables_in_explain(&plan);

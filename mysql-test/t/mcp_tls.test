@@ -60,9 +60,22 @@ def guardrails_over_https():
     C.ok("https_get_405", st == 405, st)
 
 
+def https_unusable():
+    """The listener is bound but its certificate and key do not correspond.
+    Record what a client actually gets."""
+    try:
+        sid = C.init()
+        C.ok("https_bound_but_handshake_fails", sid is None,
+             "handshake succeeded, session %s" % sid)
+    except Exception as e:                    # noqa: BLE001 - the point is which
+        C.ok("https_bound_but_handshake_fails", True)
+        print("handshake_error_kind: %s" % type(e).__name__)
+
+
 {"https_session": lambda: session_over("https"),
  "http_session": lambda: session_over("http"),
- "https_guardrails": guardrails_over_https}[MODE]()
+ "https_guardrails": guardrails_over_https,
+ "https_unusable": https_unusable}[MODE]()
 EOF
 
 --echo # --- generate a self-signed certificate for this run ---
@@ -127,6 +140,40 @@ SELECT VARIABLE_VALUE AS https_port_when_cert_missing
   FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.https_port';
 let $mcp_port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port'`;
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_tls.py $MYSQLTEST_VARDIR/tmp $mcp_port http_session
+
+--echo # --- a key that does not match its certificate fails closed ---
+--echo # A second key pair is generated, then the first cert is paired with the
+--echo # second key. Both files exist and parse; they simply do not belong
+--echo # together, which is the mistake an operator actually makes.
+--disable_query_log
+--exec openssl req -x509 -newkey rsa:2048 -keyout $MYSQL_TMP_DIR/mcp_other.key -out $MYSQL_TMP_DIR/mcp_other.crt -days 1 -nodes -subj "/CN=localhost" 2>/dev/null
+--eval SET GLOBAL vsql_mcp.ssl_cert = '$MYSQL_TMP_DIR/mcp_tls.crt'
+--eval SET GLOBAL vsql_mcp.ssl_key  = '$MYSQL_TMP_DIR/mcp_other.key'
+--enable_query_log
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+let $wait_condition=
+  SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+let $wait_condition=
+  SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+--echo # DEFECT: the listener binds anyway. The certificate and key are never
+--echo # checked against each other, so https_port publishes a port that cannot
+--echo # complete a handshake — a broken endpoint that monitoring reads as
+--echo # healthy. Pinned here; see the findings.
+let $mcp_ssl_port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.https_port'`;
+--disable_query_log
+--eval SELECT $mcp_ssl_port > 0 AS known_https_binds_with_mismatched_key
+--enable_query_log
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_tls.py $MYSQLTEST_VARDIR/tmp $mcp_ssl_port https_unusable
+--echo # the plain listener is unaffected by the TLS failure
+let $mcp_port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port'`;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_tls.py $MYSQLTEST_VARDIR/tmp $mcp_port http_session
+--remove_file $MYSQL_TMP_DIR/mcp_other.crt
+--remove_file $MYSQL_TMP_DIR/mcp_other.key
 
 --echo # --- ssl_port set but no certificate configured: no TLS listener ---
 SET GLOBAL vsql_mcp.ssl_cert = '';

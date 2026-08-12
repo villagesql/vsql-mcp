@@ -125,6 +125,7 @@ SET GLOBAL vsql_mcp.require_auth = OFF;
 SET GLOBAL vsql_mcp.bearer_token = '';
 SET GLOBAL vsql_mcp.max_rows = 1000;
 SET GLOBAL vsql_mcp.query_timeout = 30;
+SET GLOBAL vsql_mcp.session_ttl = 1800;
 SET GLOBAL vsql_mcp.db_url = '';
 SET GLOBAL vsql_mcp.ssl_cert = '';
 SET GLOBAL vsql_mcp.ssl_key = '';

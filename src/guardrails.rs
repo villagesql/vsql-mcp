@@ -74,6 +74,74 @@ pub fn file_write_target(sql: &str) -> Option<&'static str> {
     None
 }
 
+/// What a `SHOW` or `DESCRIBE` statement is asking about.
+pub enum MetadataTarget {
+    /// A specific table, which the allowlist can be applied to.
+    Table(String),
+    /// Something not scoped to one table — `SHOW TABLES`, `SHOW DATABASES`,
+    /// `SHOW STATUS`. There is no single object to check, and the answer would
+    /// enumerate names the allowlist exists to withhold.
+    NotTableScoped,
+}
+
+/// Read the object out of a `SHOW`/`DESCRIBE` statement.
+///
+/// These cannot be planned with `EXPLAIN`, so the allowlist cannot learn what
+/// they read the way it does for a query. The table-scoped forms name their
+/// object plainly enough to check directly; the rest do not, and are refused.
+///
+/// Returns `None` when the statement is not a `SHOW`/`DESCRIBE` at all.
+pub fn metadata_target(sql: &str) -> Option<MetadataTarget> {
+    let idents = idents_outside_strings(sql);
+    let mut it = idents.iter().map(String::as_str);
+    let verb = it.next()?;
+
+    // DESCRIBE t / DESC db.t / EXPLAIN t all name the table next.
+    if verb.eq_ignore_ascii_case("describe") || verb.eq_ignore_ascii_case("desc") {
+        return Some(last_of_qualified(&mut it));
+    }
+    if !verb.eq_ignore_ascii_case("show") {
+        return None;
+    }
+
+    match it.next() {
+        // SHOW CREATE TABLE t, SHOW CREATE VIEW v
+        Some(w) if w.eq_ignore_ascii_case("create") => match it.next() {
+            Some(k) if k.eq_ignore_ascii_case("table") || k.eq_ignore_ascii_case("view") => {
+                Some(last_of_qualified(&mut it))
+            }
+            _ => Some(MetadataTarget::NotTableScoped),
+        },
+        // SHOW COLUMNS FROM t, SHOW INDEX FROM t, and their synonyms. The
+        // object follows FROM or IN.
+        Some(w)
+            if ["columns", "fields", "index", "indexes", "keys"]
+                .iter()
+                .any(|k| w.eq_ignore_ascii_case(k)) =>
+        {
+            for token in it.by_ref() {
+                if token.eq_ignore_ascii_case("from") || token.eq_ignore_ascii_case("in") {
+                    return Some(last_of_qualified(&mut it));
+                }
+            }
+            Some(MetadataTarget::NotTableScoped)
+        }
+        _ => Some(MetadataTarget::NotTableScoped),
+    }
+}
+
+/// Take the next name and keep the table half, matching how the allowlist
+/// matches. `idents_outside_strings` emits `db.t` as one token, so the
+/// qualifier is still visible here.
+fn last_of_qualified<'a>(it: &mut impl Iterator<Item = &'a str>) -> MetadataTarget {
+    match it.next() {
+        None => MetadataTarget::NotTableScoped,
+        Some(name) => MetadataTarget::Table(
+            name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase(),
+        ),
+    }
+}
+
 /// Every bare identifier in the statement, in order, skipping string and
 /// backtick literals so a keyword inside a value is never mistaken for one.
 fn idents_outside_strings(sql: &str) -> Vec<String> {
@@ -125,9 +193,22 @@ fn idents_outside_strings(sql: &str) -> Vec<String> {
             b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
                 let (ident, ni) = read_ident(sql, i);
                 i = ni;
-                if !ident.is_empty() {
-                    out.push(ident.to_owned());
+                if ident.is_empty() {
+                    continue;
                 }
+                // Emit `db.t` as one token, so a caller can tell a qualifier
+                // from the next word in the statement.
+                let dot = skip_gap(sql, i);
+                if bytes.get(dot) == Some(&b'.') {
+                    let right_start = skip_gap(sql, dot + 1);
+                    let (right, ni2) = read_ident(sql, right_start);
+                    if !right.is_empty() {
+                        out.push(format!("{ident}.{right}"));
+                        i = ni2;
+                        continue;
+                    }
+                }
+                out.push(ident.to_owned());
             }
             _ => i += 1,
         }

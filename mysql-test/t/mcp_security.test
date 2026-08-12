@@ -307,19 +307,42 @@ def allowlist():
     C.rejected("allowlist_rejects_union_reaching_excluded_table", err,
                "not in vsql_mcp.allowed_tables")
 
-    # SHOW and DESCRIBE cannot be planned with EXPLAIN, so the allowlist has no
-    # way to learn what they read and they stay unavailable while one is set.
-    # What changed is the message: it says why and names the tools that do the
-    # same job under an allowlist, instead of leaking a raw parser error.
-    for name, sql in [("show_tables", "SHOW TABLES FROM mcpsec"),
-                      ("describe", "DESCRIBE mcpsec.t1"),
-                      ("show_create", "SHOW CREATE TABLE mcpsec.t1")]:
+    # SHOW and DESCRIBE cannot be planned with EXPLAIN, so their object is read
+    # from the statement. The forms naming one table are checked against the
+    # list like any other reference, and work when that table is allowed.
+    # Qualified throughout: the loopback session has no default database, so a
+    # bare name does not resolve regardless of the allowlist.
+    for name, sql in [("describe", "DESCRIBE mcpsec.t1"),
+                      ("desc_abbreviated", "DESC mcpsec.t1"),
+                      ("show_create", "SHOW CREATE TABLE mcpsec.t1"),
+                      ("show_columns", "SHOW COLUMNS FROM mcpsec.t1"),
+                      ("show_index", "SHOW INDEX FROM mcpsec.t1"),
+                      ("show_columns_filtered", "SHOW COLUMNS FROM mcpsec.t1 WHERE Field='id'")]:
+        rows = C.query_rows(sid, sql)
+        C.ok("allowlist_permits_metadata_" + name, rows is not None and len(rows) > 0, sql)
+
+    # The same forms naming an excluded table are refused, so this is not a way
+    # around the list.
+    for name, sql in [("describe", "DESCRIBE mcpsec.secret"),
+                      ("show_create", "SHOW CREATE TABLE mcpsec.secret"),
+                      ("show_columns", "SHOW COLUMNS FROM mcpsec.secret"),
+                      ("show_index", "SHOW INDEX FROM mcpsec.secret")]:
         _, err = C.tool(sid, "query", {"sql": sql})
-        C.ok("known_allowlist_refuses_" + name,
+        C.rejected("allowlist_refuses_metadata_" + name, err,
+                   "table 'secret' is not in vsql_mcp.allowed_tables")
+
+    # The enumerating forms name no single object, and their answer is the list
+    # of names the allowlist withholds, so they are refused with the reason and
+    # the tools that filter.
+    for name, sql in [("show_tables", "SHOW TABLES FROM mcpsec"),
+                      ("show_databases", "SHOW DATABASES"),
+                      ("show_status", "SHOW STATUS")]:
+        _, err = C.tool(sid, "query", {"sql": sql})
+        C.ok("allowlist_refuses_enumerating_" + name,
              "vsql_mcp.allowed_tables is set" in err, err[:180])
-        C.ok("known_allowlist_refusal_%s_is_not_a_parser_error" % name,
+        C.ok("allowlist_refusal_%s_is_not_a_parser_error" % name,
              "1064" not in err, err[:180])
-        C.ok("known_allowlist_refusal_%s_names_the_alternative" % name,
+        C.ok("allowlist_refusal_%s_names_the_alternative" % name,
              "describe_table" in err, err[:180])
 
     # The allowlist governs the introspection surface too. Column names are how
@@ -413,6 +436,29 @@ def authn():
     # GET is refused before auth is considered; 405 is the documented answer.
     st, _, _ = C.request(None, method="GET")
     C.ok("known_get_405_before_auth", st == 405, st)
+
+
+def session_expiry():
+    """vsql_mcp.session_ttl = 1. A session that goes idle past it reads as gone,
+    which is what bounds the session map for clients that never DELETE."""
+    import time
+
+    sid = C.init()
+    st, _, _ = C.rpc(sid, "ping")
+    C.ok("session_live_before_ttl", st == 200, st)
+
+    time.sleep(2.5)
+
+    st, _, _ = C.rpc(sid, "ping")
+    C.ok("session_expired_after_ttl", st == 404, st)
+    # DELETE of an expired session reports it gone rather than pretending it
+    # was terminated.
+    st, _, _ = C.request(None, method="DELETE", headers={"Mcp-Session-Id": sid})
+    C.ok("expired_session_delete_404", st in (200, 404), st)
+    # A fresh session still works, so expiry did not break the store.
+    fresh = C.init()
+    st, _, _ = C.rpc(fresh, "ping")
+    C.ok("session_after_expiry_still_issued", st == 200, st)
 
 
 def no_token():
@@ -556,6 +602,7 @@ def secrets():
 
 {"classify": classify, "layers": layers, "schema": schema_scope, "allowlist": allowlist,
  "scoped_allowlist": scoped_allowlist, "authn": authn, "no_token": no_token,
+ "session_expiry": session_expiry,
  "origin": origin,
  "sessions": sessions, "write_off": write_off, "write_on": write_on,
  "secrets": secrets}[MODE]()
@@ -599,6 +646,11 @@ SET GLOBAL vsql_mcp.require_auth = ON;
 SET GLOBAL vsql_mcp.bearer_token = '';
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port no_token
 SET GLOBAL vsql_mcp.require_auth = OFF;
+
+--echo # --- an idle session expires after session_ttl ---
+SET GLOBAL vsql_mcp.session_ttl = 1;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port session_expiry
+SET GLOBAL vsql_mcp.session_ttl = 1800;
 
 --echo # --- Origin validation (DNS rebinding defence) ---
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port origin

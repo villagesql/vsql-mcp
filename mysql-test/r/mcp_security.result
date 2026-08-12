@@ -113,15 +113,25 @@ allowlist_permits_derived_table_over_allowed_table: PASS
 known_allowlist_matches_bare_name_across_schemas: PASS
 allowlist_permits_union_of_allowed_tables: PASS
 allowlist_rejects_union_reaching_excluded_table: PASS
-known_allowlist_refuses_show_tables: PASS
-known_allowlist_refusal_show_tables_is_not_a_parser_error: PASS
-known_allowlist_refusal_show_tables_names_the_alternative: PASS
-known_allowlist_refuses_describe: PASS
-known_allowlist_refusal_describe_is_not_a_parser_error: PASS
-known_allowlist_refusal_describe_names_the_alternative: PASS
-known_allowlist_refuses_show_create: PASS
-known_allowlist_refusal_show_create_is_not_a_parser_error: PASS
-known_allowlist_refusal_show_create_names_the_alternative: PASS
+allowlist_permits_metadata_describe: PASS
+allowlist_permits_metadata_desc_abbreviated: PASS
+allowlist_permits_metadata_show_create: PASS
+allowlist_permits_metadata_show_columns: PASS
+allowlist_permits_metadata_show_index: PASS
+allowlist_permits_metadata_show_columns_filtered: PASS
+allowlist_refuses_metadata_describe: PASS
+allowlist_refuses_metadata_show_create: PASS
+allowlist_refuses_metadata_show_columns: PASS
+allowlist_refuses_metadata_show_index: PASS
+allowlist_refuses_enumerating_show_tables: PASS
+allowlist_refusal_show_tables_is_not_a_parser_error: PASS
+allowlist_refusal_show_tables_names_the_alternative: PASS
+allowlist_refuses_enumerating_show_databases: PASS
+allowlist_refusal_show_databases_is_not_a_parser_error: PASS
+allowlist_refusal_show_databases_names_the_alternative: PASS
+allowlist_refuses_enumerating_show_status: PASS
+allowlist_refusal_show_status_is_not_a_parser_error: PASS
+allowlist_refusal_show_status_names_the_alternative: PASS
 allowlist_applied_to_resource_read: PASS
 allowlist_resource_read_leaks_no_ddl: PASS
 allowlist_applied_to_describe_table: PASS
@@ -163,6 +173,13 @@ no_token_refuses_bare_scheme: PASS
 no_token_refuses_missing_header: PASS
 no_token_refuses_any_credential: PASS
 SET GLOBAL vsql_mcp.require_auth = OFF;
+# --- an idle session expires after session_ttl ---
+SET GLOBAL vsql_mcp.session_ttl = 1;
+session_live_before_ttl: PASS
+session_expired_after_ttl: PASS
+expired_session_delete_404: PASS
+session_after_expiry_still_issued: PASS
+SET GLOBAL vsql_mcp.session_ttl = 1800;
 # --- Origin validation (DNS rebinding defence) ---
 origin_rejects_https_evil_example: PASS
 origin_rejects_http_localhost_evil_com: PASS
@@ -230,6 +247,7 @@ SET GLOBAL vsql_mcp.require_auth = OFF;
 SET GLOBAL vsql_mcp.bearer_token = '';
 SET GLOBAL vsql_mcp.max_rows = 1000;
 SET GLOBAL vsql_mcp.query_timeout = 30;
+SET GLOBAL vsql_mcp.session_ttl = 1800;
 SET GLOBAL vsql_mcp.db_url = '';
 SET GLOBAL vsql_mcp.ssl_cert = '';
 SET GLOBAL vsql_mcp.ssl_key = '';

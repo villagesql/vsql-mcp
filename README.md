@@ -87,7 +87,7 @@ All variables are `SET GLOBAL vsql_mcp.<name>`.
 | `allowed_tables` | `""` | Comma-separated table allowlist; empty means all |
 | `max_rows` | 1000 | Row cap per `query` result |
 | `query_timeout` | 30 | Per-tool-call statement timeout (seconds) |
-| `schema_ttl` | 60 | Schema cache TTL (seconds) |
+| `session_ttl` | 1800 | Idle MCP session lifetime (seconds) |
 | `db_url` | `""` | Loopback DSN tool queries run through |
 
 HTTPS is served when both `ssl_cert` and `ssl_key` are set, and not otherwise —
@@ -149,9 +149,13 @@ Applied to every `query`, `explain`, and `write` call:
   what it can read: `describe_table` and `vsql://<schema>/<table>` refuse an
   excluded table, and `list_tables` and `resources/list` omit it.
 
-  `SHOW` and `DESCRIBE` cannot be planned, so the allowlist has no way to learn
-  which tables they read; while one is set they are refused, and the message
-  points at `list_tables` and `describe_table` instead.
+  `SHOW` and `DESCRIBE` cannot be planned, so their object is read from the
+  statement instead. The forms naming one table — `DESCRIBE t`,
+  `SHOW CREATE TABLE t`, `SHOW COLUMNS FROM t`, `SHOW INDEX FROM t` — are
+  checked against the list like any other reference. The forms that enumerate,
+  such as `SHOW TABLES` and `SHOW DATABASES`, are refused while a list is set,
+  because their answer is the names the list exists to withhold; the message
+  points at `list_tables` and `describe_table`, which filter.
 - **No writes to the filesystem.** `SELECT ... INTO OUTFILE` and `INTO DUMPFILE`
   are refused. They begin with `SELECT`, so neither the statement allowlist nor
   the read-only session stops them; without this the only thing that would is
