@@ -36,6 +36,13 @@ let $wait_condition=
 --source include/wait_condition.inc
 let $port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port'`;
 
+# The info() VDF reports server state without an HTTP round trip. With the
+# listener up it says enabled and names a bound port; the port itself is
+# per-run, so only the "> 0" fact is printed. The VDF returns a binary-charset
+# string (the VEF default), so JSON functions need an explicit CONVERT.
+SELECT JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.enabled') AS info_enabled,
+       JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.http_port') > 0 AS info_http_port_bound;
+
 --write_file $MYSQLTEST_VARDIR/tmp/mcp_driver.py
 import sys, json, urllib.request, urllib.error
 
@@ -209,41 +216,41 @@ def session():
 EOF
 
 --echo # --- protocol, tools, resources, transport rules ---
---exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port protocol
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port protocol
 
 --echo # --- max_rows truncation ---
 SET GLOBAL vsql_mcp.max_rows = 1;
---exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port maxrows
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port maxrows
 SET GLOBAL vsql_mcp.max_rows = 1000;
 
 --echo # --- query_timeout ---
 SET GLOBAL vsql_mcp.query_timeout = 2;
---exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port timeout
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port timeout
 SET GLOBAL vsql_mcp.query_timeout = 30;
 
 --echo # --- bearer auth ---
 SET GLOBAL vsql_mcp.require_auth = ON;
 SET GLOBAL vsql_mcp.bearer_token = 'secret123';
---exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port authfail secret123
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port authfail secret123
 SET GLOBAL vsql_mcp.require_auth = OFF;
 
 --echo # --- allowed_tables ---
 SET GLOBAL vsql_mcp.allowed_tables = 'mcptest.t1';
---exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port allowed
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port allowed
 SET GLOBAL vsql_mcp.allowed_tables = '';
 
 --echo # --- schema scoping ---
 SET GLOBAL vsql_mcp.schema = 'mcptest';
---exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port schema
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port schema
 SET GLOBAL vsql_mcp.schema = '';
 
 --echo # --- write tool ---
 SET GLOBAL vsql_mcp.allow_write = ON;
---exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port write
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port write
 SET GLOBAL vsql_mcp.allow_write = OFF;
 
 --echo # --- session lifecycle ---
---exec python3 $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port session
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_driver.py $port session
 
 --echo # --- status counters advanced past zero ---
 SELECT VARIABLE_VALUE > 0 AS tool_calls_positive
@@ -265,6 +272,10 @@ let $wait_condition=
 SELECT VARIABLE_VALUE AS sessions_active
   FROM performance_schema.global_status
  WHERE VARIABLE_NAME = 'vsql_mcp.sessions_active';
+
+# info() reflects the stop: not enabled, no bound port.
+SELECT JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.enabled') AS info_enabled_after_stop,
+       JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.http_port') AS info_http_port_after_stop;
 
 --remove_file $MYSQLTEST_VARDIR/tmp/mcp_driver.py
 DROP SCHEMA mcptest;

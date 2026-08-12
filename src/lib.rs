@@ -59,8 +59,12 @@ fn worker(reason: WakeupReason, _handle: ThreadHandle) -> NextWakeup {
         WakeupReason::Periodic | WakeupReason::PollFd => {
             if PENDING_START.swap(false, Ordering::Relaxed) {
                 let cfg = ListenConfig::read();
-                httpd::start(&cfg);
-                ENABLED.store(true, Ordering::Relaxed);
+                // Reflect what actually happened: if the HTTP listener did not
+                // bind (port in use, say), nothing is serving, so `info()` and
+                // the status vars must not report an enabled server. A re-toggle
+                // of vsql_mcp_enabled retries; auto-retrying here would spin.
+                let bound = httpd::start(&cfg);
+                ENABLED.store(bound, Ordering::Relaxed);
             }
             httpd::poll();
         }

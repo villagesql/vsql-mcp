@@ -74,6 +74,14 @@ def engine_errors():
     C.ok("guardrail_rejection_is_tool_error_over_200",
          st == 200 and body["result"].get("isError") is True, (st, body))
 
+    # A multibyte identifier outside string literals must not panic the byte-wise
+    # guardrail scanners (MySQL allows Unicode identifiers). The call comes back
+    # as a normal tool error, not a dropped connection / 500.
+    st, body, _ = C.rpc(sid, "tools/call",
+                        {"name": "query", "arguments": {"sql": u"SELECT * FROM mcpsec.tëst"}})
+    C.ok("multibyte_identifier_no_panic",
+         st == 200 and "result" in body and body["result"].get("isError") is True, (st, body))
+
 
 def read_timeout():
     """query_timeout = 2 against a plan that cannot finish in time.

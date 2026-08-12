@@ -988,12 +988,11 @@ version = "0.0.1"
 
 [[package]]
 name = "vsql_mcp"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "mysql",
  "rustls",
  "rustls-pemfile",
- "serde",
  "serde_json",
  "tiny_http",
  "villagesql",

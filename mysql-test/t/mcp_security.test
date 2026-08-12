@@ -371,6 +371,14 @@ def allowlist():
     C.ok("allowlist_resources_list_names_no_excluded_table",
          all("/secret" not in u for u in uris), uris)
 
+    # The bare-schema overview enumerates table names as well, so the allowlist
+    # narrows it exactly as it narrows list_tables: the excluded table (and the
+    # excluded view v_secret) must not appear in the overview text.
+    st, body, _ = C.rpc(sid, "resources/read", {"uri": "vsql://mcpsec"})
+    overview = ((body.get("result", {}).get("contents") or [{}])[0].get("text", "")) if body else ""
+    C.ok("allowlist_filters_schema_overview",
+         "t1" in overview and "secret" not in overview, overview[:200])
+
     # The allowed table stays fully reachable through the same surfaces.
     obj, err = C.jtool(sid, "describe_table", {"schema": "mcpsec", "table": "t1"})
     cols = [c["name"] for c in obj["columns"]] if obj else []

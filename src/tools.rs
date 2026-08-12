@@ -238,9 +238,15 @@ fn query(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<J
 fn explain(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
     let sql = arg_str(args, "sql")?;
     // Only plan statements that are otherwise runnable by a tool, and hold them
-    // to the same schema and allowlist scope as the query/write tools.
+    // to the same schema and allowlist scope as the query/write tools. A write
+    // is planned only when the write tool itself is enabled — with writes off,
+    // planning one still discloses the target's structure and row estimates.
     match guardrails::classify(sql) {
-        StmtKind::Read | StmtKind::Write => {}
+        StmtKind::Read => {}
+        StmtKind::Write if cfg.allow_write => {}
+        StmtKind::Write => {
+            return Err("cannot explain a write statement while vsql_mcp.allow_write = OFF".to_owned())
+        }
         StmtKind::Disallowed => return Err("cannot explain that statement".to_owned()),
     }
     check_access(sql, cfg, exec)?;

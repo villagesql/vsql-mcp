@@ -144,6 +144,12 @@ fn last_of_qualified<'a>(it: &mut impl Iterator<Item = &'a str>) -> MetadataTarg
 
 /// Every bare identifier in the statement, in order, skipping string and
 /// backtick literals so a keyword inside a value is never mistaken for one.
+///
+// TODO(villagesql): the quote/backtick/`''`-escape scanning here is hand-rolled
+// four times (idents_outside_strings, has_trailing_statement, qualified_refs,
+// table_refs). Extract one tokenizer yielding classified spans so a change to
+// the escape rules lands in a single place. Kept separate for now to avoid
+// reworking security-critical lexing in an unrelated change.
 fn idents_outside_strings(sql: &str) -> Vec<String> {
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
@@ -379,6 +385,11 @@ fn qualified_refs(sql: &str) -> Vec<(String, String)> {
 /// Advance past whitespace and comments starting at `start`, returning the
 /// index of the next byte that is neither. Used wherever MySQL allows a gap
 /// that must not change how a reference reads.
+///
+/// Works on bytes throughout. The scanners that call this walk unrecognized
+/// bytes one at a time, so `start` can land in the middle of a multibyte UTF-8
+/// sequence (a Unicode identifier, which MySQL allows); slicing the `str` there
+/// would panic, so every comparison here is against the byte slice.
 fn skip_gap(sql: &str, start: usize) -> usize {
     let bytes = sql.as_bytes();
     let mut i = start;
@@ -386,13 +397,13 @@ fn skip_gap(sql: &str, start: usize) -> usize {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        if sql[i..].starts_with("/*") {
-            match sql[i + 2..].find("*/") {
+        if bytes[i..].starts_with(b"/*") {
+            match find_bytes(&bytes[i + 2..], b"*/") {
                 Some(end) => i = i + 2 + end + 2,
                 None => return bytes.len(),
             }
-        } else if sql[i..].starts_with("--") || sql[i..].starts_with('#') {
-            match sql[i..].find('\n') {
+        } else if bytes[i..].starts_with(b"--") || bytes.get(i) == Some(&b'#') {
+            match bytes[i..].iter().position(|&b| b == b'\n') {
                 Some(end) => i += end + 1,
                 None => return bytes.len(),
             }
@@ -400,6 +411,11 @@ fn skip_gap(sql: &str, start: usize) -> usize {
             return i;
         }
     }
+}
+
+/// Index of the first occurrence of `needle` in `haystack`, by bytes.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// A table named in table position, with its `schema.` qualifier and the alias

@@ -6,7 +6,9 @@
 
 use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::mpsc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use serde_json::Value as Json;
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -19,14 +21,25 @@ use crate::{mcp, status};
 /// into memory.
 const MAX_BODY_BYTES: u64 = 1 << 20;
 
+/// How long the worker will wait for a request body before abandoning the read.
+/// tiny_http hands over a request with headers parsed but the body unread, and
+/// that read happens on the worker thread; on loopback a 1 MiB body arrives in
+/// milliseconds, so this only ever fires on a client that has stopped sending.
+const BODY_READ_TIMEOUT_S: u64 = 30;
+
 /// Live listeners while the server is enabled. Taken and dropped on stop.
 static SERVERS: Mutex<Option<Vec<Server>>> = Mutex::new(None);
 
 /// Bind the plain HTTP listener and, when TLS material is configured, the HTTPS
 /// listener. Idempotent-ish: any previously held servers are dropped first.
-pub fn start(cfg: &ListenConfig) {
+///
+/// Returns whether the HTTP listener bound. A false return means nothing is
+/// serving — the caller reflects that in `enabled` rather than reporting a
+/// server that isn't there.
+pub fn start(cfg: &ListenConfig) -> bool {
     stop();
     let mut servers = Vec::new();
+    let mut http_bound = false;
 
     // port 0 asks the OS to assign one; a negative port cannot occur (the sys
     // var min is 0), so an unconditional bind is correct.
@@ -34,6 +47,7 @@ pub fn start(cfg: &ListenConfig) {
         Ok(s) => {
             status::set_http_port(bound_port(&s));
             servers.push(s);
+            http_bound = true;
         }
         Err(e) => log(&format!("failed to bind HTTP port {}: {e}", cfg.port)),
     }
@@ -53,6 +67,7 @@ pub fn start(cfg: &ListenConfig) {
     }
 
     *SERVERS.lock().unwrap_or_else(|e| e.into_inner()) = Some(servers);
+    http_bound
 }
 
 /// The port a bound listener actually got. With `port = 0` the OS assigns one,
@@ -169,9 +184,12 @@ pub fn stop() {
 /// worker's periodic wakeup, so it must never block or panic out.
 ///
 /// Requests are collected under the SERVERS lock but handled after it is
-/// released: a tool call can run for up to `query_timeout` seconds, and
-/// `stop()` (which fires from inside the server's sys-var critical section)
-/// must not wait that long for the lock.
+/// released. Disable runs `stop()` on this same worker thread after the poll
+/// loop returns, and the server's `worker_stop()` blocks the thread that ran
+/// `SET GLOBAL ... = OFF` in `thread.join()` until it does — so anything that
+/// blocks here (a long tool call, or a stalled body read) delays disable and
+/// shutdown by exactly that long. The body read is bounded for this reason (see
+/// `read_body`); holding the lock only to collect keeps it off the critical path.
 pub fn poll() {
     let requests: Vec<Request> = {
         let guard = SERVERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -231,6 +249,11 @@ fn origin_ok(req: &Request) -> bool {
                 .split('/')
                 .next()
                 .unwrap_or("");
+            // Drop any `userinfo@` prefix: `http://127.0.0.1:9999@evil.com` has
+            // authority `127.0.0.1:9999@evil.com`, whose real host is `evil.com`.
+            // A browser never sends this (RFC 6454 Origin has no userinfo), but a
+            // `:port` split on the raw authority would read the host as local.
+            let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
             // Strip a bracketed IPv6 host first (`[::1]` or `[::1]:port`), then
             // a trailing `:port` on a bare host. Without pulling the brackets
             // off first, the `:port` split would cut inside the address.
@@ -321,7 +344,7 @@ fn handle(request: Request) {
     }
 }
 
-fn handle_post(mut request: Request) {
+fn handle_post(request: Request) {
     let cfg = RequestConfig::read();
     if !auth_ok(&request, cfg.require_auth, &cfg.bearer_token) {
         respond_empty(request, 401);
@@ -336,18 +359,18 @@ fn handle_post(mut request: Request) {
         return;
     }
 
-    // Read the (bounded) body first; the mutable borrow ends here, so headers
-    // can be read afterwards without cloning them out.
-    let mut body = String::new();
-    if request
-        .as_reader()
-        .take(MAX_BODY_BYTES + 1)
-        .read_to_string(&mut body)
-        .is_err()
-    {
-        respond_json(request, 400, &mcp::error(&Json::Null, -32700, "could not read request body"));
-        return;
-    }
+    // Read the (bounded) body without letting a slow client wedge the worker.
+    let (request, body) = match read_body(request) {
+        BodyRead::Ok(request, body) => (request, body),
+        BodyRead::ReadError(request) => {
+            respond_json(request, 400, &mcp::error(&Json::Null, -32700, "could not read request body"));
+            return;
+        }
+        // The reader stalled and was abandoned to its helper thread, which owns
+        // the request and drops it (closing the socket) once the read finally
+        // ends. There is nothing to respond on here; the worker moves on.
+        BodyRead::TimedOut => return,
+    };
     if body.len() as u64 > MAX_BODY_BYTES {
         respond_empty(request, 413);
         return;
@@ -436,6 +459,43 @@ fn handle_post(mut request: Request) {
     let exec = Loopback::new(&cfg.db_url);
     let response = mcp::dispatch(method, params, &id, &cfg, &exec);
     respond_json(request, 200, &response);
+}
+
+/// The outcome of a bounded body read.
+enum BodyRead {
+    /// The body was read; the request is returned to respond on.
+    Ok(Request, String),
+    /// The read failed (client hung up mid-body, encoding error); the request
+    /// is returned so a 400 can still be sent.
+    ReadError(Request),
+    /// The read did not finish within `BODY_READ_TIMEOUT_S`. The request has
+    /// been left with the helper thread and cannot be responded on here.
+    TimedOut,
+}
+
+/// Read the request body on a helper thread so a client that sends a short body
+/// and then stalls cannot block the worker's poll loop — which would in turn
+/// hang disable and shutdown (see `poll`). The read is bounded to `MAX_BODY_BYTES
+/// + 1` for the size check, and the worker waits at most `BODY_READ_TIMEOUT_S`.
+fn read_body(request: Request) -> BodyRead {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut request = request;
+        let mut body = String::new();
+        let ok = request
+            .as_reader()
+            .take(MAX_BODY_BYTES + 1)
+            .read_to_string(&mut body)
+            .is_ok();
+        // The receiver is gone on timeout; the send simply fails and the request
+        // drops here, closing the socket.
+        let _ = tx.send((request, body, ok));
+    });
+    match rx.recv_timeout(Duration::from_secs(BODY_READ_TIMEOUT_S)) {
+        Ok((request, body, true)) => BodyRead::Ok(request, body),
+        Ok((request, _, false)) => BodyRead::ReadError(request),
+        Err(_) => BodyRead::TimedOut,
+    }
 }
 
 fn log(msg: &str) {

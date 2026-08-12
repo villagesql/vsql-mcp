@@ -2,7 +2,7 @@
 
 [package]
 name = "vsql_mcp"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 description = "VillageSQL extension: expose a database as a Model Context Protocol (MCP) server"
 license = "GPL-2.0"
@@ -13,7 +13,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 villagesql = { path = "../vsql-rust-sdk/villagesql" }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiny_http = { version = "0.12", features = ["ssl-rustls"] }
 # Already in the tree via tiny_http's ssl-rustls feature; named directly so the

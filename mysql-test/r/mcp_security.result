@@ -137,6 +137,7 @@ allowlist_resource_read_leaks_no_ddl: PASS
 allowlist_applied_to_describe_table: PASS
 allowlist_filters_list_tables: PASS
 allowlist_resources_list_names_no_excluded_table: PASS
+allowlist_filters_schema_overview: PASS
 allowlist_permits_describe_of_allowed_table: PASS
 allowlist_permits_resource_read_of_allowed_table: PASS
 # --- schema and allowlist together ---

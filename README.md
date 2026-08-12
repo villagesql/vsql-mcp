@@ -210,7 +210,18 @@ origin gets HTTP 403), as the MCP Streamable HTTP spec requires.
 - **No SSE / server-initiated messages.** `GET /mcp` returns HTTP 405, which the
   spec allows for servers without a stream; there are no progress notifications.
 - **Requests are handled one at a time.** The worker drains and serves requests
-  serially; `query_timeout` bounds how long any one call can hold the line.
+  serially; `query_timeout` bounds how long any one call can hold the line. A
+  stalled request body is read on a helper thread with a bounded wait, so a slow
+  client cannot wedge the worker or block disable/shutdown.
+- **The allowlist does not see through a stored function.** `allowed_tables` and
+  `schema` are enforced on the tables a statement plans with `EXPLAIN`, which
+  does not descend into a function body. A `SELECT some_function()` names no
+  table, so it passes both checks even if the function reads an excluded table.
+  Likewise a read tool can call any function the `db_url` account may call —
+  including one that opens a network connection (`http_get()` and the like) — so
+  a read grants the full reach of installed functions, not only table reads.
+  When you need hard confinement, put it in the `db_url` account's `GRANT`s, not
+  only in `allowed_tables`.
 - **Secrets are visible to privileged users.** `bearer_token` and `db_url` (which
   embeds a password) are global variables readable via `SHOW VARIABLES` by users
   with the privilege.

@@ -35,6 +35,13 @@ fn session_ttl() -> Duration {
     crate::config::session_ttl()
 }
 
+/// Upper bound on live sessions, so a client that keeps calling `initialize`
+/// without ever deleting cannot grow the map without limit before the TTL
+/// evicts. Past the cap the oldest session is dropped to make room.
+const MAX_SESSIONS: usize = 4096;
+
+/// Each session is the id and the last time it was seen. The instant is
+/// refreshed on use so the TTL is genuinely idle-based (see `session_exists`).
 static SESSIONS: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -55,18 +62,32 @@ pub fn new_session() -> String {
     let id = format!("{a:016x}{b:016x}");
     let ttl = session_ttl();
     let mut map = lock_sessions();
-    map.retain(|_, created| created.elapsed() < ttl);
+    map.retain(|_, seen| seen.elapsed() < ttl);
+    // If eviction did not get the map back under the cap (every session still
+    // live), drop the least-recently-seen one so an initialize flood is bounded.
+    if map.len() >= MAX_SESSIONS {
+        if let Some(oldest) = map.iter().min_by_key(|(_, seen)| **seen).map(|(k, _)| k.clone()) {
+            map.remove(&oldest);
+        }
+    }
     map.insert(id.clone(), Instant::now());
     status::set_sessions_active(map.len() as i64);
     id
 }
 
-/// A read-only check: an expired session reads as gone even before eviction.
+/// Whether a session is live, refreshing its last-seen time when it is. The TTL
+/// is idle-based — a session in active use never expires under a client — so the
+/// check is also the touch that keeps it alive.
 pub fn session_exists(id: &str) -> bool {
     let ttl = session_ttl();
-    lock_sessions()
-        .get(id)
-        .is_some_and(|created| created.elapsed() < ttl)
+    let mut map = lock_sessions();
+    match map.get_mut(id) {
+        Some(seen) if seen.elapsed() < ttl => {
+            *seen = Instant::now();
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Remove a session. Returns true if it existed.
@@ -128,7 +149,10 @@ pub fn dispatch(method: &str, params: &Json, id: &Json, cfg: &RequestConfig, exe
         "ping" => result(id, json!({})),
         "tools/list" => result(id, tools::list(cfg)),
         "tools/call" => tools::call(params, id, cfg, exec),
-        "resources/list" => result(id, resources::list(cfg, exec)),
+        "resources/list" => match resources::list(cfg, exec) {
+            Ok(value) => result(id, value),
+            Err(msg) => error(id, -32603, &msg),
+        },
         "resources/read" => resources::read(params, id, cfg, exec),
         _ => error(id, -32601, &format!("method not found: {method}")),
     }

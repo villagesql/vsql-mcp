@@ -12,10 +12,13 @@ use crate::mcp;
 /// Advertise resources: one per exposed schema plus one per table. When no
 /// schema is configured, only schema-level resources are listed (enumerating
 /// every table in every schema would be unbounded).
-pub fn list(cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Json {
+///
+/// A failed introspection query surfaces as an error rather than an empty list:
+/// a broken `db_url` and a server with no schemas must not read the same.
+pub fn list(cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
     let mut resources = Vec::new();
     let schemas: Vec<String> = if cfg.schema.is_empty() {
-        executor::schema_names(exec, cfg.query_timeout).unwrap_or_default()
+        executor::schema_names(exec, cfg.query_timeout)?
     } else {
         vec![cfg.schema.clone()]
     };
@@ -31,24 +34,23 @@ pub fn list(cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Json {
 
     // When a single schema is exposed, also enumerate its tables.
     if !cfg.schema.is_empty() {
-        if let Ok(rows) = executor::tables_in_schema(exec, &cfg.schema, cfg.query_timeout) {
-            for row in &rows.rows {
-                if let Some(table) = row.get("TABLE_NAME").and_then(Json::as_str) {
-                    if !crate::guardrails::table_allowed(table, &cfg.allowed_tables) {
-                        continue;
-                    }
-                    resources.push(json!({
-                        "uri": format!("vsql://{}/{table}", cfg.schema),
-                        "name": format!("{}.{table}", cfg.schema),
-                        "description": "CREATE TABLE DDL",
-                        "mimeType": "text/plain"
-                    }));
+        let rows = executor::tables_in_schema(exec, &cfg.schema, cfg.query_timeout)?;
+        for row in &rows.rows {
+            if let Some(table) = row.get("TABLE_NAME").and_then(Json::as_str) {
+                if !crate::guardrails::table_allowed(table, &cfg.allowed_tables) {
+                    continue;
                 }
+                resources.push(json!({
+                    "uri": format!("vsql://{}/{table}", cfg.schema),
+                    "name": format!("{}.{table}", cfg.schema),
+                    "description": "CREATE TABLE DDL",
+                    "mimeType": "text/plain"
+                }));
             }
         }
     }
 
-    json!({ "resources": resources })
+    Ok(json!({ "resources": resources }))
 }
 
 /// Handle `resources/read` and return a full JSON-RPC response.
@@ -109,18 +111,31 @@ fn table_ddl(schema: &str, table: &str, cfg: &RequestConfig, exec: &dyn QueryExe
 
 fn schema_overview(schema: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<String, String> {
     let rows = executor::tables_in_schema(exec, schema, cfg.query_timeout)?;
+    // The overview enumerates table names, so it is bound by the same allowlist
+    // as list_tables and resources/list: an excluded table is simply not shown,
+    // never revealed as existing. Filter through the one shared predicate.
+    let visible: Vec<&Json> = rows
+        .rows
+        .iter()
+        .filter(|r| {
+            r.get("TABLE_NAME")
+                .and_then(Json::as_str)
+                .is_some_and(|t| crate::guardrails::table_allowed(t, &cfg.allowed_tables))
+        })
+        .collect();
     let mut out = format!("Schema: {schema}\nTables:\n");
-    if rows.rows.is_empty() {
+    if visible.is_empty() {
         // An empty listing and a mistyped name look identical, so a client that
         // got the name wrong would read a plausible "no tables" answer instead
         // of a correction. Only pay for the lookup when there is nothing to
-        // report.
-        if !executor::schema_exists(exec, schema, cfg.query_timeout)? {
+        // report. A schema that exists but shows nothing (all tables excluded,
+        // or genuinely empty) reads as "(none)".
+        if rows.rows.is_empty() && !executor::schema_exists(exec, schema, cfg.query_timeout)? {
             return Err(format!("no such schema: {schema}"));
         }
         out.push_str("  (none)\n");
     }
-    for row in &rows.rows {
+    for row in visible {
         let name = row.get("TABLE_NAME").and_then(Json::as_str).unwrap_or("?");
         let kind = row.get("TABLE_TYPE").and_then(Json::as_str).unwrap_or("");
         let est = row.get("TABLE_ROWS").map(|v| v.to_string()).unwrap_or_default();

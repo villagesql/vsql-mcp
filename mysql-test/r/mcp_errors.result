@@ -39,6 +39,7 @@ error_message_is_the_engine_sentence: PASS
 error_message_has_no_driver_wrapper: PASS
 known_division_by_zero_is_null_not_error: PASS
 guardrail_rejection_is_tool_error_over_200: PASS
+multibyte_identifier_no_panic: PASS
 # --- read timeout ---
 SET GLOBAL vsql_mcp.query_timeout = 2;
 read_timeout_returns_an_error: PASS

@@ -136,16 +136,17 @@ impl RequestConfig {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .collect();
-        // Bounds: max_rows >= 1, query_timeout in 1..=3600 (see SPECS), so both
-        // conversions cannot fail or wrap.
+        // The SPECS bounds (max_rows min 1; query_timeout 1..=3600) and the
+        // >= 1 fallbacks mean both values are always positive, so the casts
+        // neither wrap nor need clamping.
         Self {
             schema: get_str(c"schema"),
             require_auth: get_bool(c"require_auth"),
             bearer_token: get_str(c"bearer_token"),
             allow_write: get_bool(c"allow_write"),
             allowed_tables,
-            max_rows: get_int(c"max_rows", DEFAULT_MAX_ROWS).max(1) as usize,
-            query_timeout: get_int(c"query_timeout", DEFAULT_QUERY_TIMEOUT).max(1) as u64,
+            max_rows: get_int(c"max_rows", DEFAULT_MAX_ROWS) as usize,
+            query_timeout: get_int(c"query_timeout", DEFAULT_QUERY_TIMEOUT) as u64,
             db_url: get_str(c"db_url"),
         }
     }
@@ -168,5 +169,6 @@ pub fn port_settings() -> (i64, i64) {
 /// How long an idle session stays valid. Read per use rather than cached so a
 /// change applies to the next request, like every other setting here.
 pub fn session_ttl() -> std::time::Duration {
-    std::time::Duration::from_secs(get_int(c"session_ttl", DEFAULT_SESSION_TTL).max(1) as u64)
+    // session_ttl has SPECS min 1 and a >= 1 fallback, so it is always positive.
+    std::time::Duration::from_secs(get_int(c"session_ttl", DEFAULT_SESSION_TTL) as u64)
 }
