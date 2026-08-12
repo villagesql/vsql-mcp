@@ -295,23 +295,33 @@ def framing():
                             headers={"Mcp-Session-Id": sid})
     C.ok("framing_notification_acknowledged_202", st == 202 and body is None, (st, body))
 
-    # 2025-06-18 REMOVED JSON-RPC batching, so a batch must be refused. It is
-    # instead swallowed as if it were a notification: 202, no body, nothing
-    # executed and nothing reported.
+    # 2025-06-18 removed JSON-RPC batching. A batch must be refused with an
+    # error rather than swallowed: an array has no top-level id, so without an
+    # explicit check it takes the notification path and a batching client waits
+    # forever for responses that are never coming.
     st, body, _ = C.request([{"jsonrpc": "2.0", "id": 1, "method": "ping"},
                              {"jsonrpc": "2.0", "id": 2, "method": "ping"}],
                             headers={"Mcp-Session-Id": sid})
-    C.ok("known_framing_batch_silently_accepted_202", st == 202 and body is None, (st, body))
+    C.ok("framing_batch_refused", st == 400 and is_rpc_error(body, -32600), (st, body))
+    C.ok("framing_batch_error_says_why",
+         "batching" in body["error"]["message"], body)
 
-    # The jsonrpc member is never validated, so a 1.0 or absent version is
-    # answered as though it were 2.0.
+    # A body that is neither object nor array is not a request either.
+    st, body, _ = C.request(raw=b'"just a string"', headers={"Mcp-Session-Id": sid})
+    C.ok("framing_non_object_refused", st == 400 and is_rpc_error(body, -32600), (st, body))
+
+    # The jsonrpc member is required and must be exactly "2.0".
     st, body, _ = C.request({"jsonrpc": "1.0", "id": 1, "method": "ping"},
                             headers={"Mcp-Session-Id": sid})
-    C.ok("known_framing_wrong_jsonrpc_version_accepted",
-         st == 200 and "result" in body, (st, body))
+    C.ok("framing_wrong_jsonrpc_version_refused",
+         st == 400 and is_rpc_error(body, -32600), (st, body))
+    C.ok("framing_wrong_jsonrpc_echoes_id", body.get("id") == 1, body)
     st, body, _ = C.request({"id": 1, "method": "ping"}, headers={"Mcp-Session-Id": sid})
-    C.ok("known_framing_absent_jsonrpc_member_accepted",
-         st == 200 and "result" in body, (st, body))
+    C.ok("framing_absent_jsonrpc_member_refused",
+         st == 400 and is_rpc_error(body, -32600), (st, body))
+    # A well-formed request is unaffected.
+    st, body, _ = C.rpc(sid, "ping")
+    C.ok("framing_valid_jsonrpc_accepted", st == 200 and "result" in body, (st, body))
 
     # An explicit null id is a request as far as this server is concerned and
     # is echoed back as null.

@@ -250,6 +250,40 @@ fn handle_post(mut request: Request) {
         }
     };
 
+    // Revision 2025-06-18 removed JSON-RPC batching. An array body would
+    // otherwise fall through to the notification path below — no top-level id,
+    // so 202 and no body — leaving a batching client waiting for responses that
+    // are never coming.
+    if msg.is_array() {
+        respond_json(
+            request,
+            400,
+            &mcp::error(
+                &Json::Null,
+                -32600,
+                "JSON-RPC batching was removed in MCP 2025-06-18; send one request per POST",
+            ),
+        );
+        return;
+    }
+    if !msg.is_object() {
+        respond_json(
+            request,
+            400,
+            &mcp::error(&Json::Null, -32600, "request must be a JSON object"),
+        );
+        return;
+    }
+    if msg.get("jsonrpc").and_then(Json::as_str) != Some(mcp::JSONRPC_VERSION) {
+        let id = msg.get("id").cloned().unwrap_or(Json::Null);
+        respond_json(
+            request,
+            400,
+            &mcp::error(&id, -32600, "jsonrpc must be \"2.0\""),
+        );
+        return;
+    }
+
     let method = msg.get("method").and_then(Json::as_str);
     let id = msg.get("id").cloned();
     let params = msg.get("params").unwrap_or(&Json::Null);

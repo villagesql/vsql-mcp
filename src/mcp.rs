@@ -20,6 +20,9 @@ use crate::{resources, status, tools};
 /// Protocol version this server implements and advertises.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// The only JSON-RPC version MCP uses. Required on every request.
+pub const JSONRPC_VERSION: &str = "2.0";
+
 /// Versions accepted in the `MCP-Protocol-Version` header. `2025-03-26` is the
 /// value the spec says to assume when the header is absent, so we accept it too.
 pub const SUPPORTED_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26"];

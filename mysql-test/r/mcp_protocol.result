@@ -108,9 +108,13 @@ framing_empty_body_rejected: PASS
 framing_missing_method_is_invalid_request: PASS
 framing_unknown_method_is_method_not_found: PASS
 framing_notification_acknowledged_202: PASS
-known_framing_batch_silently_accepted_202: PASS
-known_framing_wrong_jsonrpc_version_accepted: PASS
-known_framing_absent_jsonrpc_member_accepted: PASS
+framing_batch_refused: PASS
+framing_batch_error_says_why: PASS
+framing_non_object_refused: PASS
+framing_wrong_jsonrpc_version_refused: PASS
+framing_wrong_jsonrpc_echoes_id: PASS
+framing_absent_jsonrpc_member_refused: PASS
+framing_valid_jsonrpc_accepted: PASS
 known_framing_null_id_treated_as_request: PASS
 framing_duplicate_id_answered_independently: PASS
 framing_response_shape: PASS
