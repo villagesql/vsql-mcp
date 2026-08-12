@@ -78,7 +78,7 @@ All variables are `SET GLOBAL vsql_mcp.<name>`.
 |---|---|---|
 | `vsql_mcp_enabled` | OFF | Start/stop the server |
 | `port` | 3100 | HTTP listen port (0 = OS-assigned) |
-| `ssl_port` | 3143 | HTTPS listen port (0 = disabled) |
+| `ssl_port` | 3143 | HTTPS listen port (0 = OS-assigned) |
 | `ssl_cert` / `ssl_key` | `""` | PEM paths; both required to serve HTTPS |
 | `schema` | `""` | Schema to expose (empty = all non-system schemas) |
 | `require_auth` | OFF | Require a bearer token on every request |
@@ -89,6 +89,9 @@ All variables are `SET GLOBAL vsql_mcp.<name>`.
 | `query_timeout` | 30 | Per-tool-call statement timeout (seconds) |
 | `schema_ttl` | 60 | Schema cache TTL (seconds) |
 | `db_url` | `""` | Loopback DSN tool queries run through |
+
+HTTPS is served when both `ssl_cert` and `ssl_key` are set, and not otherwise —
+leaving either empty is how you turn TLS off, whatever `ssl_port` says.
 
 Port and TLS changes take effect when the server is next enabled — toggle
 `vsql_mcp_enabled` OFF then ON after changing them.

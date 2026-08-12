@@ -23,18 +23,31 @@ import urllib.request
 
 PORT = None
 BASE = None
+SCHEME = "http"
+SSL_CONTEXT = None
 
 PROTOCOL = "2025-06-18"
 
 
-def configure(port):
-    global PORT, BASE
+def configure(port, scheme="http"):
+    """Point the client at a listener. Pass scheme="https" for the TLS one; the
+    suite's certificate is self-signed, so verification is turned off — this is
+    a loopback listener the test itself just configured, not a trust decision."""
+    global PORT, BASE, SCHEME, SSL_CONTEXT
     PORT = str(port)
-    BASE = "http://127.0.0.1:%s/mcp" % PORT
+    SCHEME = scheme
+    BASE = "%s://127.0.0.1:%s/mcp" % (scheme, PORT)
+    if scheme == "https":
+        import ssl
+        SSL_CONTEXT = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        SSL_CONTEXT.check_hostname = False
+        SSL_CONTEXT.verify_mode = ssl.CERT_NONE
+    else:
+        SSL_CONTEXT = None
 
 
 def url(path="/mcp"):
-    return "http://127.0.0.1:%s%s" % (PORT, path)
+    return "%s://127.0.0.1:%s%s" % (SCHEME, PORT, path)
 
 
 def request(body=None, method="POST", headers=None, path="/mcp", raw=None,
@@ -70,7 +83,7 @@ def request(body=None, method="POST", headers=None, path="/mcp", raw=None,
 
     req = urllib.request.Request(url(path), data=data, headers=h, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as r:
             text = r.read().decode(errors="replace")
             status, rhdr = r.status, dict(r.headers)
     except urllib.error.HTTPError as e:

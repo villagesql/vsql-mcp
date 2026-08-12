@@ -1,0 +1,165 @@
+# vsql_mcp — the HTTPS listener.
+#
+# Nothing else in the suite touches TLS, so a defect in tls_server() would be
+# invisible everywhere else. This drives a real MCP session over HTTPS and
+# checks the three things that can go wrong with a second listener: that it
+# serves at all, that the plain one keeps working beside it, and that bad or
+# missing certificate material fails closed instead of silently serving.
+#
+# The certificate is self-signed and generated per run under MYSQL_TMP_DIR, so
+# concurrent workers cannot clobber a shared path. Both ports are OS-assigned.
+# TLS material is read at bind time, so every change here is followed by a
+# disable/enable cycle and a fresh read of both port status variables.
+
+--source mcp_env.inc
+--source mcp_client.inc
+
+--write_file $MYSQLTEST_VARDIR/tmp/mcp_tls.py
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import mcp_client as C
+
+MODE = sys.argv[3]
+C.configure(sys.argv[2], "https" if MODE.startswith("https") else "http")
+
+
+def session_over(label):
+    """A full MCP exchange, so this proves the transport carries the protocol
+    rather than merely completing a handshake."""
+    sid = C.init()
+    C.ok("%s_session_issued" % label, bool(sid), sid)
+
+    st, body, _ = C.rpc(sid, "tools/list")
+    names = sorted(t["name"] for t in body["result"]["tools"]) if body else []
+    C.ok("%s_tools_list" % label, "query" in names, names)
+
+    rows = C.query_rows(sid, "SELECT name FROM mcpsec.t1 ORDER BY id")
+    C.ok("%s_query_returns_rows" % label,
+         [r["name"] for r in (rows or [])] == ["alpha", "beta", "gamma"], rows)
+
+    st, body, _ = C.rpc(sid, "resources/read", {"uri": "vsql://mcpsec/t1"})
+    ddl = ((body or {}).get("result", {}).get("contents") or [{}])[0].get("text", "")
+    C.ok("%s_resource_read" % label, "CREATE TABLE" in ddl, ddl[:60])
+
+    st, _, _ = C.request(None, method="DELETE", headers={"Mcp-Session-Id": sid})
+    C.ok("%s_session_delete" % label, st == 200, st)
+
+
+def guardrails_over_https():
+    """The guardrails are transport-independent; assert that rather than assume
+    it, since the TLS path builds its own request objects."""
+    sid = C.init()
+    _, err = C.tool(sid, "query", {"sql": "DROP TABLE mcpsec.t1"})
+    C.rejected("https_guardrail_still_applies", err,
+               "only a single read-only statement is allowed by the query tool")
+    st, _, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                         origin="https://evil.example")
+    C.ok("https_origin_check_still_applies", st == 403, st)
+    st, _, _ = C.request(None, method="GET")
+    C.ok("https_get_405", st == 405, st)
+
+
+{"https_session": lambda: session_over("https"),
+ "http_session": lambda: session_over("http"),
+ "https_guardrails": guardrails_over_https}[MODE]()
+EOF
+
+--echo # --- generate a self-signed certificate for this run ---
+--exec openssl req -x509 -newkey rsa:2048 -keyout $MYSQL_TMP_DIR/mcp_tls.key -out $MYSQL_TMP_DIR/mcp_tls.crt -days 1 -nodes -subj "/CN=localhost" 2>/dev/null && echo "cert generated"
+
+--disable_query_log
+--eval SET GLOBAL vsql_mcp.ssl_cert = '$MYSQL_TMP_DIR/mcp_tls.crt'
+--eval SET GLOBAL vsql_mcp.ssl_key  = '$MYSQL_TMP_DIR/mcp_tls.key'
+--enable_query_log
+SET GLOBAL vsql_mcp.ssl_port = 0;
+
+--echo # TLS material is read when the listener binds, so cycle the server.
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+let $wait_condition=
+  SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+let $wait_condition=
+  SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.https_port';
+--source include/wait_condition.inc
+
+--echo # both listeners are bound
+SELECT VARIABLE_VALUE > 0 AS http_listening FROM performance_schema.global_status
+ WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+SELECT VARIABLE_VALUE > 0 AS https_listening FROM performance_schema.global_status
+ WHERE VARIABLE_NAME = 'vsql_mcp.https_port';
+let $mcp_port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port'`;
+let $mcp_ssl_port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.https_port'`;
+
+--echo # the two listeners are on different ports
+--disable_query_log
+--eval SELECT $mcp_port <> $mcp_ssl_port AS ports_differ
+--enable_query_log
+
+--echo # --- a full MCP session over HTTPS ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_tls.py $MYSQLTEST_VARDIR/tmp $mcp_ssl_port https_session
+
+--echo # --- the guardrails apply on the TLS listener too ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_tls.py $MYSQLTEST_VARDIR/tmp $mcp_ssl_port https_guardrails
+
+--echo # --- plain HTTP still serves while HTTPS is up ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_tls.py $MYSQLTEST_VARDIR/tmp $mcp_port http_session
+
+--echo # --- a missing certificate file fails closed ---
+--echo # HTTPS must not bind, and the plain listener must be unaffected.
+--disable_query_log
+--eval SET GLOBAL vsql_mcp.ssl_cert = '$MYSQL_TMP_DIR/does_not_exist.crt'
+--enable_query_log
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+let $wait_condition=
+  SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+let $wait_condition=
+  SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+SELECT VARIABLE_VALUE AS https_port_when_cert_missing
+  FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.https_port';
+let $mcp_port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port'`;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_tls.py $MYSQLTEST_VARDIR/tmp $mcp_port http_session
+
+--echo # --- ssl_port set but no certificate configured: no TLS listener ---
+SET GLOBAL vsql_mcp.ssl_cert = '';
+SET GLOBAL vsql_mcp.ssl_key = '';
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+let $wait_condition=
+  SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+let $wait_condition=
+  SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+SELECT VARIABLE_VALUE AS https_port_without_cert
+  FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.https_port';
+
+--echo # --- disabling the server drops the TLS listener too ---
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+let $wait_condition=
+  SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+SELECT VARIABLE_VALUE AS https_port_after_disable
+  FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.https_port';
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+let $wait_condition=
+  SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+
+--remove_file $MYSQL_TMP_DIR/mcp_tls.crt
+--remove_file $MYSQL_TMP_DIR/mcp_tls.key
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_tls.py
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_client.py
+--source mcp_env_cleanup.inc

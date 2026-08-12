@@ -38,7 +38,11 @@ pub fn start(cfg: &ListenConfig) {
         Err(e) => log(&format!("failed to bind HTTP port {}: {e}", cfg.port)),
     }
 
-    if cfg.ssl_port > 0 && !cfg.ssl_cert.is_empty() && !cfg.ssl_key.is_empty() {
+    // TLS is configured by having certificate material, not by the port number.
+    // That leaves `ssl_port = 0` free to mean OS-assigned, as it does for the
+    // plain listener — without which there is no way to bind an ephemeral TLS
+    // port, and no way to test this listener under parallel workers.
+    if !cfg.ssl_cert.is_empty() && !cfg.ssl_key.is_empty() {
         match tls_server(cfg) {
             Ok(s) => {
                 status::set_https_port(bound_port(&s));
