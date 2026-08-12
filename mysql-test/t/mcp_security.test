@@ -135,16 +135,25 @@ def layers():
     _, err = C.tool(sid, "query", {"sql": "WITH c AS (SELECT 1) DELETE FROM mcpsec.t1"})
     C.ok("cte_delete_caught_by_session_layer", "READ ONLY transaction" in err, err[:120])
 
-    # INTO OUTFILE/DUMPFILE begin with SELECT, so the classifier passes them and
-    # a read-only transaction does not stop a write to the filesystem. The only
-    # thing standing in the way is the loopback account lacking FILE. Nothing in
-    # vsql_mcp refuses it.
-    _, err = C.tool(sid, "query", {"sql": "SELECT id FROM mcpsec.t1 INTO OUTFILE '/tmp/mcp_guardrail_probe.txt'"})
-    C.ok("known_into_outfile_stopped_only_by_grants",
-         "FILE privilege" in err, err[:140])
-    _, err = C.tool(sid, "query", {"sql": "SELECT id FROM mcpsec.t1 LIMIT 1 INTO DUMPFILE '/tmp/mcp_guardrail_probe2.txt'"})
-    C.ok("known_into_dumpfile_stopped_only_by_grants",
-         "FILE privilege" in err, err[:140])
+    # INTO OUTFILE/DUMPFILE begin with SELECT, so the classifier reads them as a
+    # read, and a read-only transaction does not stop a write to the filesystem.
+    # They are refused explicitly rather than left depending on the loopback
+    # account lacking FILE.
+    for name, sql in [
+            ("outfile", "SELECT id FROM mcpsec.t1 INTO OUTFILE '/tmp/mcp_probe.txt'"),
+            ("dumpfile", "SELECT id FROM mcpsec.t1 LIMIT 1 INTO DUMPFILE '/tmp/mcp_probe2.txt'"),
+            ("extra_space", "SELECT id FROM mcpsec.t1 INTO   OUTFILE '/tmp/mcp_probe3.txt'"),
+            ("mixed_case", "SELECT id FROM mcpsec.t1 InTo OuTfIlE '/tmp/mcp_probe4.txt'"),
+            ("comment_gap", "SELECT id FROM mcpsec.t1 INTO/* x */OUTFILE '/tmp/mcp_probe5.txt'")]:
+        _, err = C.tool(sid, "query", {"sql": sql})
+        C.ok("file_write_refused_" + name,
+             "writes to the server filesystem" in err, err[:140])
+
+    # The words are only keywords as SQL; inside a literal they are data.
+    rows = C.query_rows(sid, "SELECT 'INTO OUTFILE' AS s")
+    C.ok("file_write_check_ignores_string_literal", rows == [{"s": "INTO OUTFILE"}], rows)
+    rows = C.query_rows(sid, "SELECT id FROM mcpsec.t1 WHERE id=1")
+    C.ok("file_write_check_leaves_normal_reads_alone", rows == [{"id": 1}], rows)
 
 
 def schema_scope():
@@ -272,14 +281,20 @@ def allowlist():
     C.rejected("allowlist_rejects_union_reaching_excluded_table", err,
                "not in vsql_mcp.allowed_tables")
 
-    # DEFECT: check_access() plans every statement with EXPLAIN FORMAT=JSON, but
-    # SHOW and DESCRIBE cannot be planned, so setting an allowlist makes the
-    # whole SHOW/DESCRIBE family unusable with a raw syntax error.
+    # SHOW and DESCRIBE cannot be planned with EXPLAIN, so the allowlist has no
+    # way to learn what they read and they stay unavailable while one is set.
+    # What changed is the message: it says why and names the tools that do the
+    # same job under an allowlist, instead of leaking a raw parser error.
     for name, sql in [("show_tables", "SHOW TABLES FROM mcpsec"),
                       ("describe", "DESCRIBE mcpsec.t1"),
                       ("show_create", "SHOW CREATE TABLE mcpsec.t1")]:
         _, err = C.tool(sid, "query", {"sql": sql})
-        C.ok("known_allowlist_breaks_" + name, "1064" in err, err[:140])
+        C.ok("known_allowlist_refuses_" + name,
+             "vsql_mcp.allowed_tables is set" in err, err[:180])
+        C.ok("known_allowlist_refusal_%s_is_not_a_parser_error" % name,
+             "1064" not in err, err[:180])
+        C.ok("known_allowlist_refusal_%s_names_the_alternative" % name,
+             "describe_table" in err, err[:180])
 
     # The allowlist governs the introspection surface too. Column names are how
     # an agent finds what to ask for, so leaving them readable would hand back

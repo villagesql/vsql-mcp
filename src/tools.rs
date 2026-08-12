@@ -264,11 +264,28 @@ fn write(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<J
 /// to run. Uses EXPLAIN FORMAT=JSON to learn which tables the optimizer will
 /// actually touch, so joins and subqueries are covered.
 fn check_access(sql: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<(), String> {
+    if let Some(target) = guardrails::file_write_target(sql) {
+        return Err(format!(
+            "{target} writes to the server filesystem and is not allowed"
+        ));
+    }
     if let Some(bad) = guardrails::schema_violation(sql, &cfg.schema) {
         return Err(format!("schema '{bad}' is outside the exposed schema"));
     }
     if cfg.allowed_tables.is_empty() {
         return Ok(());
+    }
+    // SHOW and DESCRIBE cannot be planned, so EXPLAIN below would fail with a
+    // parser error that says nothing about why. Refuse them with the reason and
+    // the tools that do the same job under an allowlist.
+    let verb = guardrails::leading_verb(sql);
+    if matches!(verb.as_str(), "show" | "describe" | "desc") {
+        return Err(format!(
+            "{} cannot be used while vsql_mcp.allowed_tables is set, because it \
+             cannot be planned to check which tables it reads; use the \
+             list_tables and describe_table tools instead",
+            verb.to_uppercase()
+        ));
     }
     let plan = explain_json(sql, cfg, exec)?;
     let mut tables = guardrails::tables_in_explain(&plan);

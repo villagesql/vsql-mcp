@@ -137,6 +137,14 @@ Applied to every `query`, `explain`, and `write` call:
   The allowlist also governs what an agent can learn about a table, not only
   what it can read: `describe_table` and `vsql://<schema>/<table>` refuse an
   excluded table, and `list_tables` and `resources/list` omit it.
+
+  `SHOW` and `DESCRIBE` cannot be planned, so the allowlist has no way to learn
+  which tables they read; while one is set they are refused, and the message
+  points at `list_tables` and `describe_table` instead.
+- **No writes to the filesystem.** `SELECT ... INTO OUTFILE` and `INTO DUMPFILE`
+  are refused. They begin with `SELECT`, so neither the statement allowlist nor
+  the read-only session stops them; without this the only thing that would is
+  the `db_url` account lacking `FILE`.
 - **Row cap.** `max_rows` caps a `query` result and marks it `truncated`.
 - **Statement timeout.** `query_timeout` bounds each call via
   `MAX_EXECUTION_TIME` and a client read timeout.

@@ -55,8 +55,13 @@ session_has_statement_timeout: PASS
 session_row_cap_is_server_side: PASS
 for_update_caught_by_session_layer: PASS
 cte_delete_caught_by_session_layer: PASS
-known_into_outfile_stopped_only_by_grants: PASS
-known_into_dumpfile_stopped_only_by_grants: PASS
+file_write_refused_outfile: PASS
+file_write_refused_dumpfile: PASS
+file_write_refused_extra_space: PASS
+file_write_refused_mixed_case: PASS
+file_write_refused_comment_gap: PASS
+file_write_check_ignores_string_literal: PASS
+file_write_check_leaves_normal_reads_alone: PASS
 # --- schema scoping ---
 SET GLOBAL vsql_mcp.schema = 'mcpsec';
 schema_reject_plain: PASS
@@ -102,9 +107,15 @@ allowlist_permits_derived_table_over_allowed_table: PASS
 known_allowlist_matches_bare_name_across_schemas: PASS
 allowlist_permits_union_of_allowed_tables: PASS
 allowlist_rejects_union_reaching_excluded_table: PASS
-known_allowlist_breaks_show_tables: PASS
-known_allowlist_breaks_describe: PASS
-known_allowlist_breaks_show_create: PASS
+known_allowlist_refuses_show_tables: PASS
+known_allowlist_refusal_show_tables_is_not_a_parser_error: PASS
+known_allowlist_refusal_show_tables_names_the_alternative: PASS
+known_allowlist_refuses_describe: PASS
+known_allowlist_refusal_describe_is_not_a_parser_error: PASS
+known_allowlist_refusal_describe_names_the_alternative: PASS
+known_allowlist_refuses_show_create: PASS
+known_allowlist_refusal_show_create_is_not_a_parser_error: PASS
+known_allowlist_refusal_show_create_names_the_alternative: PASS
 allowlist_applied_to_resource_read: PASS
 allowlist_resource_read_leaks_no_ddl: PASS
 allowlist_applied_to_describe_table: PASS

@@ -40,6 +40,101 @@ pub fn classify(sql: &str) -> StmtKind {
     }
 }
 
+/// The statement's leading keyword, lowercased, after leading comments and
+/// whitespace are stripped. Empty when the statement starts with something that
+/// is not a bare word.
+pub fn leading_verb(sql: &str) -> String {
+    strip_leading(sql)
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// The file-writing target of a `SELECT ... INTO OUTFILE`/`INTO DUMPFILE`, if
+/// the statement has one.
+///
+/// These begin with `SELECT`, so classification reads them as a read, and a
+/// read-only transaction does not stop a write to the filesystem. Without this
+/// the only thing refusing them is the loopback account lacking `FILE`, which
+/// makes a guardrail called read-only depend entirely on a grant.
+pub fn file_write_target(sql: &str) -> Option<&'static str> {
+    let mut previous_was_into = false;
+    for ident in idents_outside_strings(sql) {
+        if previous_was_into {
+            if ident.eq_ignore_ascii_case("outfile") {
+                return Some("INTO OUTFILE");
+            }
+            if ident.eq_ignore_ascii_case("dumpfile") {
+                return Some("INTO DUMPFILE");
+            }
+        }
+        previous_was_into = ident.eq_ignore_ascii_case("into");
+    }
+    None
+}
+
+/// Every bare identifier in the statement, in order, skipping string and
+/// backtick literals so a keyword inside a value is never mistaken for one.
+fn idents_outside_strings(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        // A comment between two keywords must not read as an identifier
+        // separating them, or `INTO/* x */OUTFILE` would slip past.
+        let after_gap = skip_gap(sql, i);
+        if after_gap != i {
+            i = after_gap;
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_single = true;
+                i += 1;
+            }
+            b'"' => {
+                in_double = true;
+                i += 1;
+            }
+            b'`' => {
+                let (_, ni) = read_ident(sql, i);
+                i = ni;
+            }
+            b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
+                let (ident, ni) = read_ident(sql, i);
+                i = ni;
+                if !ident.is_empty() {
+                    out.push(ident.to_owned());
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
 /// Strip leading `--`, `#`, and `/* */` comments and whitespace.
 fn strip_leading(sql: &str) -> &str {
     let mut s = sql.trim_start();
