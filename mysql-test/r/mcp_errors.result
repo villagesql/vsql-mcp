@@ -72,6 +72,7 @@ empty_no_matching_rows_has_columns: PASS
 empty_no_matching_rows_counted: PASS
 empty_table_has_columns: PASS
 empty_schema_lists_no_tables: PASS
+unknown_schema_refused_by_list_tables: PASS
 empty_schema_overview_says_none: PASS
 describe_table_on_view: PASS
 empty_aggregate_returns_null_row: PASS

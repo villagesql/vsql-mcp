@@ -111,6 +111,13 @@ fn schema_overview(schema: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) 
     let rows = executor::tables_in_schema(exec, schema, cfg.query_timeout)?;
     let mut out = format!("Schema: {schema}\nTables:\n");
     if rows.rows.is_empty() {
+        // An empty listing and a mistyped name look identical, so a client that
+        // got the name wrong would read a plausible "no tables" answer instead
+        // of a correction. Only pay for the lookup when there is nothing to
+        // report.
+        if !executor::schema_exists(exec, schema, cfg.query_timeout)? {
+            return Err(format!("no such schema: {schema}"));
+        }
         out.push_str("  (none)\n");
     }
     for row in &rows.rows {

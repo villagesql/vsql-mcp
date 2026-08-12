@@ -89,8 +89,9 @@ def protocol():
     st, body, _ = call({"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
                        headers={"Mcp-Session-Id": sid})
     names = sorted(t["name"] for t in body["result"]["tools"])
+    # write is advertised only while allow_write is ON, which it is not here.
     ok("tools_list", names == ["describe_table", "explain", "list_schemas",
-                               "list_tables", "query", "write"], str(names))
+                               "list_tables", "query"], str(names))
 
     text, _ = tool(sid, "query", {"sql": "SELECT name FROM mcptest.t1 ORDER BY id"})
     rows = json.loads(text)["rows"] if text else []

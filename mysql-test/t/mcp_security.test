@@ -415,11 +415,19 @@ def sessions():
 
 def write_off():
     sid = C.init()
-    # The tool stays advertised while disabled, so an agent reading tools/list
-    # believes it can write and only learns otherwise by trying.
+    # The tool is not advertised while it is disabled, so an agent never plans
+    # around a capability it does not have. The read tools are unaffected.
     st, body, _ = C.rpc(sid, "tools/list")
-    names = [t["name"] for t in body["result"]["tools"]]
-    C.ok("known_write_tool_listed_while_disabled", "write" in names, names)
+    names = sorted(t["name"] for t in body["result"]["tools"])
+    C.ok("write_tool_absent_from_listing_while_disabled", "write" not in names, names)
+    C.ok("read_tools_still_listed_while_write_disabled",
+         names == ["describe_table", "explain", "list_schemas", "list_tables", "query"], names)
+
+    # It is still refused if called directly, since a listing is advice and not
+    # an access control.
+    _, err = C.tool(sid, "write", {"sql": "INSERT INTO mcpsec.t1 VALUES (9,'zeta')"})
+    C.rejected("write_refused_when_called_directly_while_disabled", err,
+               "the write tool is disabled")
 
     for sql in ["INSERT INTO mcpsec.t1 VALUES (9,'zeta')",
                 "DELETE FROM mcpsec.t1",
@@ -430,6 +438,10 @@ def write_off():
 
 def write_on():
     sid = C.init()
+    st, body, _ = C.rpc(sid, "tools/list")
+    names = sorted(t["name"] for t in body["result"]["tools"])
+    C.ok("write_tool_listed_when_enabled", "write" in names, names)
+
     obj, err = C.jtool(sid, "write", {"sql": "INSERT INTO mcpsec.t1 VALUES (9,'zeta')"})
     C.ok("write_insert_reports_affected_rows", obj == {"affected_rows": 1}, obj or err)
 

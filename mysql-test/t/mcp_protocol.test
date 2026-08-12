@@ -229,10 +229,11 @@ def resources():
          and "mcpsec.t1/extra" in body["error"]["message"], body)
 
     # Percent-encoding is not decoded, so an encoded separator stays part of the
-    # name and fails closed rather than resolving to a table.
+    # schema name rather than resolving to a table. It fails closed, naming the
+    # undecoded string so the mistake is obvious.
     st, body, _ = read("vsql://mcpsec%2Ft1")
-    C.ok("known_resource_percent_encoding_not_decoded",
-         "result" in body and "mcpsec%2Ft1" in body["result"]["contents"][0]["text"], body)
+    C.ok("resource_percent_encoded_separator_not_decoded",
+         is_rpc_error(body, -32602) and "mcpsec%2Ft1" in body["error"]["message"], body)
 
     # A non-vsql scheme and an empty schema are both refused.
     st, body, _ = read("http://mcpsec/t1")
@@ -244,11 +245,13 @@ def resources():
     C.ok("resource_missing_uri_param_refused", is_rpc_error(body, -32602)
          and "missing required parameter: uri" in body["error"]["message"], body)
 
-    # A schema that does not exist reads as an empty schema rather than an
-    # error, so a client cannot tell "no tables" from "no such schema".
+    # A schema that does not exist is an error, not an empty schema: a client
+    # that mistyped a name gets a correction rather than a plausible "no
+    # tables" answer.
     st, body, _ = read("vsql://nosuchschema")
-    C.ok("known_resource_unknown_schema_reads_as_empty",
-         "result" in body and "(none)" in body["result"]["contents"][0]["text"], body)
+    C.ok("resource_unknown_schema_refused", is_rpc_error(body, -32602), body)
+    C.ok("resource_unknown_schema_names_it",
+         "no such schema: nosuchschema" in body["error"]["message"], body)
 
 
 def scoped_resources():
@@ -402,7 +405,11 @@ EOF
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_proto.py $MYSQLTEST_VARDIR/tmp $mcp_port handshake
 
 --echo # --- tools/list schema validation ---
+--echo # allow_write is ON so the write tool is advertised and its schema is
+--echo # validated alongside the others.
+SET GLOBAL vsql_mcp.allow_write = ON;
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_proto.py $MYSQLTEST_VARDIR/tmp $mcp_port schemas
+SET GLOBAL vsql_mcp.allow_write = OFF;
 
 --echo # --- tools/call argument handling ---
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_proto.py $MYSQLTEST_VARDIR/tmp $mcp_port args

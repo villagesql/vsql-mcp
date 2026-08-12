@@ -166,6 +166,11 @@ def empty_states():
     C.ok("empty_schema_lists_no_tables",
          obj is not None and obj["tables"] == [] and obj["schema"] == "mcpempty", obj or err)
 
+    # A schema with no tables and a schema that does not exist are different
+    # answers, so a mistyped name is corrected rather than read as empty.
+    _, err = C.tool(sid, "list_tables", {"schema": "nosuchschema"})
+    C.rejected("unknown_schema_refused_by_list_tables", err, "no such schema: nosuchschema")
+
     st, body, _ = C.rpc(sid, "resources/read", {"uri": "vsql://mcpempty"})
     text = body["result"]["contents"][0]["text"]
     C.ok("empty_schema_overview_says_none", "(none)" in text, text[:80])

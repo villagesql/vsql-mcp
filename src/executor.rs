@@ -54,6 +54,17 @@ pub fn schema_names(exec: &dyn QueryExecutor, timeout_s: u64) -> Result<Vec<Stri
         .collect())
 }
 
+/// Whether a schema exists at all. Used to tell "this schema has no tables"
+/// apart from "there is no such schema", which otherwise read identically.
+pub fn schema_exists(exec: &dyn QueryExecutor, schema: &str, timeout_s: u64) -> Result<bool, String> {
+    let rows = exec.read_params(
+        "SELECT 1 AS present FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+        vec![MyValue::from(schema.to_owned())],
+        timeout_s,
+    )?;
+    Ok(!rows.rows.is_empty())
+}
+
 /// List the tables and views in one schema, with row estimates.
 pub fn tables_in_schema(
     exec: &dyn QueryExecutor,

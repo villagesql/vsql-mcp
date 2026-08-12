@@ -104,7 +104,10 @@ The server advertises six tools via `tools/list`:
 | `describe_table` | Columns, types, and keys for a table |
 | `query` | Run a single read-only `SELECT` and return JSON rows |
 | `explain` | `EXPLAIN FORMAT=JSON` for a candidate query |
-| `write` | One `INSERT`/`UPDATE`/`DELETE` (requires `allow_write = ON`) |
+| `write` | One `INSERT`/`UPDATE`/`DELETE`/`REPLACE` (requires `allow_write = ON`) |
+
+`write` is advertised in `tools/list` only while `allow_write` is ON, so an
+agent never plans around a tool it cannot use.
 
 Tool results follow the MCP shape: a `content` array with a JSON text block,
 plus `isError`. A rejected statement returns `isError: true` with a message
@@ -116,8 +119,12 @@ Applied to every `query`, `explain`, and `write` call:
 
 - **Read-only enforcement.** `query` accepts a single `SELECT`/`SHOW`/`WITH`/
   `EXPLAIN`/`DESCRIBE`; the loopback session is also set `READ ONLY`. `write`
-  accepts a single `INSERT`/`UPDATE`/`DELETE` and only when `allow_write` is ON.
-  A trailing second statement is rejected.
+  accepts a single `INSERT`/`UPDATE`/`DELETE`/`REPLACE` and only when
+  `allow_write` is ON. A trailing second statement is rejected.
+- **No row ceiling on writes.** `max_rows` caps what a `query` returns; nothing
+  caps what a `write` changes. An unqualified `DELETE` empties the table. Give
+  `db_url` an account whose grants match the blast radius you are willing to
+  accept.
 - **Schema scoping.** With `schema` set, a reference to any other schema is
   rejected.
 - **Table allowlist.** With `allowed_tables` set, the statement is planned with

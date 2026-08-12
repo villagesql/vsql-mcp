@@ -32,6 +32,9 @@ pre_initialize_refused_tools_call: PASS
 pre_initialize_refused_resources_list: PASS
 pre_initialize_refused_ping: PASS
 # --- tools/list schema validation ---
+# allow_write is ON so the write tool is advertised and its schema is
+# validated alongside the others.
+SET GLOBAL vsql_mcp.allow_write = ON;
 tools_list_names: PASS
 schema_list_schemas_has_description: PASS
 schema_list_schemas_is_object: PASS
@@ -67,6 +70,7 @@ schema_query_requires_sql: PASS
 schema_explain_requires_sql: PASS
 schema_write_requires_sql: PASS
 schema_list_schemas_requires_nothing: PASS
+SET GLOBAL vsql_mcp.allow_write = OFF;
 # --- tools/call argument handling ---
 args_missing_required_is_tool_error: PASS
 args_missing_required_names_the_argument: PASS
@@ -90,11 +94,12 @@ resource_schema_lists_tables: PASS
 resource_missing_table_is_rpc_error: PASS
 resource_traversal_contained: PASS
 resource_extra_path_segment_contained: PASS
-known_resource_percent_encoding_not_decoded: PASS
+resource_percent_encoded_separator_not_decoded: PASS
 resource_foreign_scheme_refused: PASS
 resource_missing_schema_refused: PASS
 resource_missing_uri_param_refused: PASS
-known_resource_unknown_schema_reads_as_empty: PASS
+resource_unknown_schema_refused: PASS
+resource_unknown_schema_names_it: PASS
 # --- resources under a configured schema ---
 SET GLOBAL vsql_mcp.schema = 'mcpsec';
 resource_respects_schema_scope: PASS

@@ -13,8 +13,20 @@ use crate::executor::{self, QueryExecutor};
 use crate::guardrails::{self, StmtKind};
 use crate::{mcp, status};
 
-/// The advertised tool list with input schemas.
-pub fn list() -> Json {
+/// The advertised tool list with input schemas. `write` is advertised only when
+/// it is usable: a tool an agent can see is one it will plan around, and
+/// discovering the refusal by attempting a mutation is a wasted turn.
+pub fn list(cfg: &RequestConfig) -> Json {
+    let mut listing = tool_definitions();
+    if !cfg.allow_write {
+        if let Some(tools) = listing["tools"].as_array_mut() {
+            tools.retain(|t| t.get("name").and_then(Json::as_str) != Some("write"));
+        }
+    }
+    listing
+}
+
+fn tool_definitions() -> Json {
     json!({
         "tools": [
             {
@@ -148,6 +160,9 @@ fn list_schemas(cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, S
 fn list_tables(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
     let schema = effective_schema(args.get("schema").and_then(Json::as_str), cfg)?;
     let rows = executor::tables_in_schema(exec, &schema, cfg.query_timeout)?;
+    if rows.rows.is_empty() && !executor::schema_exists(exec, &schema, cfg.query_timeout)? {
+        return Err(format!("no such schema: {schema}"));
+    }
     let tables: Vec<Json> = rows
         .rows
         .iter()

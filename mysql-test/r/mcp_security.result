@@ -155,7 +155,9 @@ session_delete_200: PASS
 session_reuse_after_delete_404: PASS
 session_sibling_still_live: PASS
 # --- write tool disabled ---
-known_write_tool_listed_while_disabled: PASS
+write_tool_absent_from_listing_while_disabled: PASS
+read_tools_still_listed_while_write_disabled: PASS
+write_refused_when_called_directly_while_disabled: PASS
 write_disabled_refuses: PASS
 write_disabled_refuses: PASS
 write_disabled_refuses: PASS
@@ -165,6 +167,7 @@ t1_rows
 3
 # --- write tool enabled ---
 SET GLOBAL vsql_mcp.allow_write = ON;
+write_tool_listed_when_enabled: PASS
 write_insert_reports_affected_rows: PASS
 write_refuses_ddl: PASS
 write_refuses_select: PASS
