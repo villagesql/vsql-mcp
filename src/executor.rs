@@ -125,6 +125,57 @@ impl<'a> Loopback<'a> {
     }
 }
 
+/// Cancels the watchdog when dropped, so a write that finishes in time is never
+/// killed. Holding the sender IS the signal: dropping it wakes the thread.
+struct KillWatchdog {
+    _cancel: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl Loopback<'_> {
+    /// Arrange for this connection's statement to be killed if it outlives
+    /// `timeout_s`, and return a guard that calls the whole thing off.
+    ///
+    /// `KILL QUERY` aborts the running statement and rolls back what it had
+    /// done, so a timed-out write does not land — which is the difference
+    /// between the caller being told "unknown" and being told "did not run".
+    /// A connection can always kill its own threads, so this needs no grant
+    /// beyond what `db_url` already has.
+    fn spawn_kill_watchdog(&self, conn: &mut Conn, timeout_s: u64) -> KillWatchdog {
+        let Ok(Some(connection_id)) = conn.query_first::<u64, _>("SELECT CONNECTION_ID()") else {
+            // Without an id there is nothing to kill. The client read timeout
+            // still bounds the call, which is the behaviour this replaces.
+            return KillWatchdog { _cancel: None };
+        };
+        let url = self.url.to_owned();
+        let (cancel, finished) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            // Timeout means the write is still running; Disconnected means the
+            // guard was dropped because it finished.
+            if finished.recv_timeout(Duration::from_secs(timeout_s))
+                != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                return;
+            }
+            let Ok(opts) = Opts::from_url(&url) else {
+                return;
+            };
+            let opts = OptsBuilder::from_opts(opts)
+                .read_timeout(Some(Duration::from_secs(KILL_TIMEOUT_S)))
+                .write_timeout(Some(Duration::from_secs(KILL_TIMEOUT_S)));
+            if let Ok(mut killer) = Conn::new(opts) {
+                let _ = killer.query_drop(format!("KILL QUERY {connection_id}"));
+            }
+        });
+        KillWatchdog {
+            _cancel: Some(cancel),
+        }
+    }
+}
+
+/// How long the watchdog's own connection may take. Short: it exists only to
+/// send one statement, and a slow kill helps nobody.
+const KILL_TIMEOUT_S: u64 = 10;
+
 impl QueryExecutor for Loopback<'_> {
     fn read(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String> {
         let mut conn = self.read_conn(timeout_s, Some(max_rows))?;
@@ -139,8 +190,15 @@ impl QueryExecutor for Loopback<'_> {
     }
 
     fn write(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
-        let mut conn = self.connect(timeout_s)?;
-        conn.query_drop(sql).map_err(map_write_err)?;
+        // MAX_EXECUTION_TIME does not apply to INSERT/UPDATE/DELETE, so the
+        // only way to bound a write is to kill it. Give the client read timeout
+        // headroom so the kill is what ends the statement, and the caller gets
+        // a definite answer instead of a dropped socket.
+        let mut conn = self.connect(timeout_s.saturating_add(READ_TIMEOUT_HEADROOM_S))?;
+        let watchdog = self.spawn_kill_watchdog(&mut conn, timeout_s);
+        let outcome = conn.query_drop(sql).map_err(map_write_err);
+        drop(watchdog);
+        outcome?;
         Ok(conn.affected_rows())
     }
 
@@ -217,6 +275,17 @@ fn map_err(e: mysql::Error) -> String {
 /// not that the statement stopped. Saying so is the difference between an agent
 /// retrying safely and an agent double-applying a write that already landed.
 fn map_write_err(e: mysql::Error) -> String {
+    // The watchdog killed it: the statement was aborted and rolled back, so
+    // the caller can say the write did not happen.
+    if let mysql::Error::MySqlError(db) = &e {
+        if db.code == ER_QUERY_INTERRUPTED {
+            return "statement exceeded vsql_mcp.query_timeout and was stopped; \
+                    the write was rolled back and did not take effect"
+                .to_owned();
+        }
+    }
+    // The client stopped waiting before the kill landed. Rare, and the honest
+    // answer here is still that the outcome is unknown.
     if is_timeout(&e) {
         return "timed out waiting for the write after vsql_mcp.query_timeout \
                 seconds; the statement may still be running on the server and \
@@ -225,6 +294,9 @@ fn map_write_err(e: mysql::Error) -> String {
     }
     describe(e)
 }
+
+/// `ER_QUERY_INTERRUPTED` — what a killed statement reports.
+const ER_QUERY_INTERRUPTED: u16 = 1317;
 
 /// Drain a query result into JSON, capping at `max_rows`. When more rows exist
 /// than the cap, `truncated` is set and the surplus is consumed and discarded.

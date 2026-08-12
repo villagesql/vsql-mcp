@@ -50,6 +50,12 @@ fn worker(reason: WakeupReason, _handle: ThreadHandle) -> NextWakeup {
             // Defer the actual bind: see PENDING_START above. No get(), no bind.
             PENDING_START.store(true, Ordering::Relaxed);
         }
+        // PollFd is handled but never armed: `NextWakeup::poll_fd` stays 0, so
+        // the periodic tick is what drains requests. There is no descriptor
+        // worth watching — tiny_http accepts on its own thread and hands over a
+        // parsed request through an in-memory queue, so the listening socket's
+        // readability says nothing about whether `poll()` has work. The tick is
+        // a queue pop every 25ms, which is negligible beside a SQL round trip.
         WakeupReason::Periodic | WakeupReason::PollFd => {
             if PENDING_START.swap(false, Ordering::Relaxed) {
                 let cfg = ListenConfig::read();

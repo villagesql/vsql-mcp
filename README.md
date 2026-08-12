@@ -161,8 +161,10 @@ Applied to every `query`, `explain`, and `write` call:
   the read-only session stops them; without this the only thing that would is
   the `db_url` account lacking `FILE`.
 - **Row cap.** `max_rows` caps a `query` result and marks it `truncated`.
-- **Statement timeout.** `query_timeout` bounds each call via
-  `MAX_EXECUTION_TIME` and a client read timeout.
+- **Statement timeout.** `query_timeout` bounds each call. A read is stopped by
+  `MAX_EXECUTION_TIME`; a write, which that setting does not govern, is stopped
+  by killing the statement, so it rolls back rather than landing after the call
+  has returned. A client read timeout backs both up.
 
 ## Resources
 
@@ -212,12 +214,12 @@ origin gets HTTP 403), as the MCP Streamable HTTP spec requires.
 - **Secrets are visible to privileged users.** `bearer_token` and `db_url` (which
   embeds a password) are global variables readable via `SHOW VARIABLES` by users
   with the privilege.
-- **`write`-tool statements have no server-side kill timeout.** `MAX_EXECUTION_TIME`
-  applies to `SELECT`; `INSERT`/`UPDATE`/`DELETE` rely on the client read timeout.
-  When that fires the client stops waiting but the statement does not stop, so it
-  may still commit. The tool result says so rather than reporting failure: treat a
-  timed-out write as an unknown outcome and check before retrying, because a
-  non-idempotent statement can otherwise be applied twice.
+- **A `write` that overruns is killed, not waited out.** `MAX_EXECUTION_TIME`
+  applies to `SELECT` only, so `query_timeout` is enforced on a write by issuing
+  `KILL QUERY` against its own connection. The statement is aborted and rolled
+  back, so a timed-out write does not take effect and the tool says so. If the
+  kill itself cannot be delivered the result falls back to reporting the outcome
+  as unknown.
 
 ## Security Considerations
 

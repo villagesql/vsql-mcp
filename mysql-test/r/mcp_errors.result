@@ -49,18 +49,23 @@ read_timeout_next_call_succeeds: PASS
 read_timeout_next_query_correct: PASS
 known_sleep_interrupted_but_statement_succeeds: PASS
 known_sleep_interrupt_is_bounded: PASS
-# --- write timeout: the call is bounded, the statement is not ---
+# --- write timeout: the statement is killed, not just abandoned ---
 SET GLOBAL vsql_mcp.allow_write = ON;
 write_timeout_returns_an_error: PASS
 write_timeout_bounded_by_client_read_timeout: PASS
-write_timeout_says_outcome_is_unknown: PASS
-write_timeout_warns_it_may_still_commit: PASS
-write_timeout_does_not_claim_failure: PASS
+write_timeout_says_it_was_stopped: PASS
+write_timeout_says_it_was_rolled_back: PASS
+write_timeout_does_not_report_unknown_outcome: PASS
 write_timeout_exposes_no_driver_internals: PASS
-# the tool reported the outcome as unknown; the UPDATE lands regardless
-SELECT COUNT(*) AS rows_written_after_reported_failure
+# the statement was killed and rolled back, so nothing was written. The
+# sleep is longer than the timeout, so if the kill had not landed the
+# UPDATE would have completed by now.
+SELECT COUNT(*) AS rows_written_after_timeout
 FROM mcpsec.t1 WHERE name = 'TIMEDOUT';
-rows_written_after_reported_failure
+rows_written_after_timeout
+0
+SELECT COUNT(*) AS rows_left_untouched FROM mcpsec.t1;
+rows_left_untouched
 3
 SET GLOBAL vsql_mcp.allow_write = OFF;
 SET GLOBAL vsql_mcp.query_timeout = 30;

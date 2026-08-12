@@ -5,11 +5,12 @@
 # with the server still serving afterwards. Never a 500, never a dropped
 # connection, never a crash.
 #
-# It also pins the two timeout behaviours. Both are worth a test rather than a
-# bug report on their own terms: one is a documented Known Limitation whose
-# real-world consequence is sharper than the README implies, and the other is a
-# message-quality defect that the existing suite cannot see because it only
-# asserts that some error came back.
+# It also covers both timeout paths, which work differently. A read is stopped
+# by MAX_EXECUTION_TIME; a write, which that setting does not govern, is stopped
+# by killing the statement. Each is asserted on the message the agent receives
+# AND, for the write, on the table afterwards — a timeout that leaves the data
+# changed is the failure worth catching, and no assertion on the response alone
+# would see it.
 
 --source mcp_env.inc
 --source mcp_client.inc
@@ -121,8 +122,8 @@ def read_timeout():
 
 def write_timeout():
     """MAX_EXECUTION_TIME does not apply to INSERT/UPDATE/DELETE, so a slow
-    write is bounded only by the client read timeout. The tool call ends; the
-    statement does not."""
+    write is killed instead. A killed statement is rolled back, so the caller
+    gets a definite answer and the table is left alone."""
     sid = C.init()
     started = time.time()
     _, err = C.tool(sid, "write",
@@ -133,15 +134,14 @@ def write_timeout():
     C.ok("write_timeout_returns_an_error", err != "", err[:120])
     C.ok("write_timeout_bounded_by_client_read_timeout", elapsed < 20, "%.1fs" % elapsed)
 
-    # The statement is not killed — MAX_EXECUTION_TIME does not apply to a
-    # write — so only the client stopped waiting. The message must not claim
-    # the write failed, because MTR confirms below that it lands anyway. An
-    # agent that reads "unknown" can check; one that reads "failed" retries and
-    # double-applies.
-    C.ok("write_timeout_says_outcome_is_unknown", "outcome is unknown" in err, err[:200])
-    C.ok("write_timeout_warns_it_may_still_commit", "may still commit" in err, err[:200])
-    C.ok("write_timeout_does_not_claim_failure",
-         "failed" not in err.lower(), err[:200])
+    # MAX_EXECUTION_TIME does not apply to a write, so the statement is killed
+    # instead. A killed statement is rolled back, which makes the outcome
+    # definite: the write did not take effect. MTR confirms that from the table
+    # below rather than from this message.
+    C.ok("write_timeout_says_it_was_stopped", "was stopped" in err, err[:200])
+    C.ok("write_timeout_says_it_was_rolled_back", "rolled back" in err, err[:200])
+    C.ok("write_timeout_does_not_report_unknown_outcome",
+         "unknown" not in err.lower(), err[:200])
     C.ok("write_timeout_exposes_no_driver_internals",
          "CodecError" not in err and "os error" not in err, err[:140])
 
@@ -217,15 +217,16 @@ EOF
 SET GLOBAL vsql_mcp.query_timeout = 2;
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port read_timeout
 
---echo # --- write timeout: the call is bounded, the statement is not ---
+--echo # --- write timeout: the statement is killed, not just abandoned ---
 SET GLOBAL vsql_mcp.allow_write = ON;
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port write_timeout
---echo # the tool reported the outcome as unknown; the UPDATE lands regardless
-let $wait_condition=
-  SELECT COUNT(*) = 3 FROM mcpsec.t1 WHERE name = 'TIMEDOUT';
---source include/wait_condition.inc
-SELECT COUNT(*) AS rows_written_after_reported_failure
+--echo # the statement was killed and rolled back, so nothing was written. The
+--echo # sleep is longer than the timeout, so if the kill had not landed the
+--echo # UPDATE would have completed by now.
+--sleep 8
+SELECT COUNT(*) AS rows_written_after_timeout
   FROM mcpsec.t1 WHERE name = 'TIMEDOUT';
+SELECT COUNT(*) AS rows_left_untouched FROM mcpsec.t1;
 SET GLOBAL vsql_mcp.allow_write = OFF;
 SET GLOBAL vsql_mcp.query_timeout = 30;
 UPDATE mcpsec.t1 SET name = CONCAT('row', id);
