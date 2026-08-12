@@ -146,15 +146,137 @@ fn qualified_refs(sql: &str) -> Vec<(String, String)> {
             b'`' | b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
                 let (left, ni) = read_ident(sql, i);
                 i = ni;
-                if bytes.get(i) == Some(&b'.') {
-                    let (right, ni2) = read_ident(sql, i + 1);
+                // MySQL accepts whitespace and comments around the qualifying
+                // dot, so `db . t` is the same reference as `db.t`. Skipping
+                // them here is what stops that spacing being a way past the
+                // schema check.
+                let dot = skip_gap(sql, i);
+                if bytes.get(dot) == Some(&b'.') {
+                    let right_start = skip_gap(sql, dot + 1);
+                    let (right, ni2) = read_ident(sql, right_start);
                     if !right.is_empty() {
                         out.push((left.to_ascii_lowercase(), right.to_ascii_lowercase()));
+                        i = ni2;
                     }
-                    i = ni2;
                 }
             }
             _ => i += 1,
+        }
+    }
+    out
+}
+
+/// Advance past whitespace and comments starting at `start`, returning the
+/// index of the next byte that is neither. Used wherever MySQL allows a gap
+/// that must not change how a reference reads.
+fn skip_gap(sql: &str, start: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let mut i = start;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if sql[i..].starts_with("/*") {
+            match sql[i + 2..].find("*/") {
+                Some(end) => i = i + 2 + end + 2,
+                None => return bytes.len(),
+            }
+        } else if sql[i..].starts_with("--") || sql[i..].starts_with('#') {
+            match sql[i..].find('\n') {
+                Some(end) => i += end + 1,
+                None => return bytes.len(),
+            }
+        } else {
+            return i;
+        }
+    }
+}
+
+/// Table names appearing in table position in the statement text: the
+/// identifier after `FROM`, `JOIN`, `INTO`, `UPDATE` or `TABLE`, with a
+/// `schema.` qualifier dropped so the result matches what `EXPLAIN` reports.
+///
+/// This is a fallback for the case where the optimizer answers a query without
+/// naming a table, so `tables_in_explain` returns nothing and cannot speak for
+/// what was touched. It is deliberately eager: over-reporting a name costs a
+/// rejection, under-reporting one costs the allowlist.
+pub fn table_refs_in_text(sql: &str) -> Vec<String> {
+    const TABLE_KEYWORDS: &[&str] = &["from", "join", "into", "update", "table"];
+
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut expect_table = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        // A comment between the keyword and the name must not lose the name.
+        let after_gap = skip_gap(sql, i);
+        if after_gap != i {
+            i = after_gap;
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_single = true;
+                i += 1;
+            }
+            b'"' => {
+                in_double = true;
+                i += 1;
+            }
+            b'`' | b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
+                let quoted = c == b'`';
+                let (ident, ni) = read_ident(sql, i);
+                i = ni;
+                if !quoted && TABLE_KEYWORDS.iter().any(|k| ident.eq_ignore_ascii_case(k)) {
+                    expect_table = true;
+                    continue;
+                }
+                if !expect_table {
+                    continue;
+                }
+                expect_table = false;
+                // `schema.table` keeps the right half, matching EXPLAIN.
+                let dot = skip_gap(sql, i);
+                if bytes.get(dot) == Some(&b'.') {
+                    let right_start = skip_gap(sql, dot + 1);
+                    let (right, ni2) = read_ident(sql, right_start);
+                    if !right.is_empty() {
+                        out.push(right.to_ascii_lowercase());
+                        i = ni2;
+                        continue;
+                    }
+                }
+                if !ident.is_empty() {
+                    out.push(ident.to_ascii_lowercase());
+                }
+            }
+            _ => {
+                // `FROM (SELECT ...)` is a derived table, not a name; the inner
+                // FROM sets the flag again for the real one.
+                expect_table = false;
+                i += 1;
+            }
         }
     }
     out
@@ -193,7 +315,13 @@ fn walk_tables(node: &Json, out: &mut Vec<String>) {
     match node {
         Json::Object(map) => {
             if let Some(Json::String(name)) = map.get("table_name") {
-                out.push(name.to_ascii_lowercase());
+                // The optimizer names its own materialisation steps here —
+                // `<union1,2>`, `<derived2>`, `<subquery3>`. They are never on
+                // an allowlist and are not tables; the real tables feeding them
+                // appear elsewhere in the same plan and are still collected.
+                if !name.starts_with('<') {
+                    out.push(name.to_ascii_lowercase());
+                }
             }
             for v in map.values() {
                 walk_tables(v, out);

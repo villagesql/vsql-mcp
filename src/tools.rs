@@ -244,7 +244,17 @@ fn check_access(sql: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Res
         return Ok(());
     }
     let plan = explain_json(sql, cfg, exec)?;
-    for table in guardrails::tables_in_explain(&plan) {
+    let mut tables = guardrails::tables_in_explain(&plan);
+    if tables.is_empty() {
+        // The optimizer can answer without reading any table — MIN()/MAX() from
+        // an index, "Impossible WHERE", LIMIT 0 — and then names none, so an
+        // empty list is "the plan cannot say", not "touches nothing". Falling
+        // back to the statement text keeps an excluded table excluded; a
+        // statement that genuinely references nothing (SELECT 1) still yields
+        // an empty list here and is allowed.
+        tables = guardrails::table_refs_in_text(sql);
+    }
+    for table in tables {
         if !guardrails::table_allowed(&table, &cfg.allowed_tables) {
             return Err(format!("table '{table}' is not in vsql_mcp.allowed_tables"));
         }

@@ -171,17 +171,17 @@ def schema_scope():
     rows = C.query_rows(sid, "SELECT 'mcpalt.t1' AS s")
     C.ok("schema_ignores_string_literal", rows == [{"s": "mcpalt.t1"}], rows)
 
-    # DEFECT: qualified_refs() only treats '<ident>.<ident>' as a reference when
-    # the dot immediately follows the identifier. MySQL accepts whitespace
-    # around the dot, so `mcpalt . t1` reaches a schema the operator excluded.
+    # MySQL accepts whitespace and comments around the qualifying dot, so
+    # `mcpalt . t1` is the same reference as `mcpalt.t1` and must be refused
+    # the same way. qualified_refs() skips the gap before testing for the dot.
     for name, sql in [
             ("space", "SELECT tag FROM mcpalt . t1"),
             ("tab", "SELECT tag FROM mcpalt\t.\tt1"),
             ("newline", "SELECT tag FROM mcpalt\n.\nt1"),
-            ("backtick_space", "SELECT tag FROM `mcpalt` . `t1`")]:
-        rows = C.query_rows(sid, sql)
-        C.ok("known_schema_bypass_whitespace_dot_" + name,
-             rows == [{"tag": "other-schema-row"}], rows)
+            ("backtick_space", "SELECT tag FROM `mcpalt` . `t1`"),
+            ("comment", "SELECT tag FROM mcpalt/* gap */.t1")]:
+        _, err = C.tool(sid, "query", {"sql": sql})
+        C.rejected("schema_reject_whitespace_dot_" + name, err, "outside the exposed schema")
 
     # DEFECT: scoping reads the submitted text only, so a view inside the
     # exposed schema is an unchecked door into any schema it was defined over.
@@ -222,26 +222,37 @@ def allowlist():
     _, err = C.tool(sid, "query", {"sql": "SELECT password_hash FROM mcpsec.v_secret"})
     C.ok("allowlist_sees_through_view", "secret" in err, err[:140])
 
-    # DEFECT: when the optimizer answers from an index without reading the
-    # table, EXPLAIN emits "Select tables optimized away" and no table_name at
-    # all, so the allowlist has nothing to reject and the statement runs. This
-    # returns the real value of a column in a table the operator excluded.
-    got = C.scalar(sid, "SELECT MIN(password_hash) AS m FROM mcpsec.secret", "m")
-    C.ok("known_allowlist_bypass_min_exfiltrates_value", got == SECRET_VALUE, got)
-    got = C.scalar(sid, "SELECT MAX(password_hash) AS m FROM mcpsec.secret", "m")
-    C.ok("known_allowlist_bypass_max_exfiltrates_value", got == SECRET_VALUE, got)
-    got = C.scalar(sid, "SELECT MIN(id) AS m FROM mcpsec.secret", "m")
-    C.ok("known_allowlist_bypass_min_on_pk", got == 1, got)
+    # When the optimizer answers from an index, or eliminates the plan
+    # entirely, EXPLAIN names no table at all. An empty plan list means "the
+    # plan cannot say", not "touches nothing", so check_access falls back to
+    # the tables named in the statement text. Without that fallback each of
+    # these reads an excluded table, and the first two return its real value.
+    for name, sql in [
+            ("min_from_index", "SELECT MIN(password_hash) AS m FROM mcpsec.secret"),
+            ("max_from_index", "SELECT MAX(password_hash) AS m FROM mcpsec.secret"),
+            ("min_on_primary_key", "SELECT MIN(id) AS m FROM mcpsec.secret"),
+            ("impossible_where", "SELECT password_hash FROM mcpsec.secret WHERE 1=0"),
+            ("limit_zero", "SELECT password_hash FROM mcpsec.secret LIMIT 0"),
+            ("qualified_with_gap", "SELECT MIN(id) AS m FROM mcpsec . secret")]:
+        _, err = C.tool(sid, "query", {"sql": sql})
+        C.rejected("allowlist_reject_optimized_away_" + name, err,
+                   "not in vsql_mcp.allowed_tables")
 
-    # DEFECT: a plan the optimizer eliminates entirely also names no table, so
-    # the statement executes against the excluded table. No rows come back, but
-    # the column list does, and existence is confirmed.
-    obj, _ = C.jtool(sid, "query", {"sql": "SELECT password_hash FROM mcpsec.secret WHERE 1=0"})
-    C.ok("known_allowlist_bypass_impossible_where",
-         obj is not None and obj.get("columns") == ["password_hash"] and obj.get("row_count") == 0, obj)
-    obj, _ = C.jtool(sid, "query", {"sql": "SELECT password_hash FROM mcpsec.secret LIMIT 0"})
-    C.ok("known_allowlist_bypass_limit_zero",
-         obj is not None and obj.get("columns") == ["password_hash"], obj)
+    # The fallback must not turn into a blanket refusal. A statement the
+    # optimizer elides against a table that IS allowed still runs, and one that
+    # references no table at all is unaffected.
+    got = C.scalar(sid, "SELECT MIN(id) AS m FROM mcpsec.t1", "m")
+    C.ok("allowlist_permits_optimized_away_on_allowed_table", got == 1, got)
+    got = C.scalar(sid, "SELECT MAX(id) AS m FROM mcpsec.t1", "m")
+    C.ok("allowlist_permits_max_on_allowed_table", got == 3, got)
+    obj, _ = C.jtool(sid, "query", {"sql": "SELECT id FROM mcpsec.t1 WHERE 1=0"})
+    C.ok("allowlist_permits_impossible_where_on_allowed_table",
+         obj is not None and obj["row_count"] == 0, obj)
+    got = C.scalar(sid, "SELECT 1 AS one", "one")
+    C.ok("allowlist_permits_statement_with_no_table", got == 1, got)
+    rows = C.query_rows(sid, "SELECT * FROM (SELECT id FROM mcpsec.t1) AS d ORDER BY id")
+    C.ok("allowlist_permits_derived_table_over_allowed_table",
+         rows == [{"id": 1}, {"id": 2}, {"id": 3}], rows)
 
     # DEFECT: matching is on bare table name, so the same name in another schema
     # inherits the allowance. Documented in the README, pinned here.
@@ -249,11 +260,17 @@ def allowlist():
     C.ok("known_allowlist_matches_bare_name_across_schemas",
          rows == [{"tag": "other-schema-row"}], rows)
 
-    # DEFECT: EXPLAIN names its own internal pseudo-tables, which are never on
-    # an allowlist, so every UNION is refused even when both arms are allowed.
-    _, err = C.tool(sid, "query", {"sql": "SELECT name FROM mcpsec.t1 UNION SELECT name FROM mcpsec.t1"})
-    C.ok("known_allowlist_rejects_union_of_allowed_tables",
-         "<union" in err, err[:140])
+    # EXPLAIN names its own materialisation steps (`<union1,2>`, `<derived2>`)
+    # in the same field as real tables. They are not tables and are never on an
+    # allowlist, so they are skipped; the real tables feeding them are still
+    # collected and still checked.
+    rows = C.query_rows(sid, "SELECT name FROM mcpsec.t1 UNION SELECT name FROM mcpsec.t1")
+    C.ok("allowlist_permits_union_of_allowed_tables",
+         rows == [{"name": "alpha"}, {"name": "beta"}, {"name": "gamma"}], rows)
+    _, err = C.tool(sid, "query", {"sql":
+        "SELECT name FROM mcpsec.t1 UNION SELECT password_hash FROM mcpsec.secret"})
+    C.rejected("allowlist_rejects_union_reaching_excluded_table", err,
+               "not in vsql_mcp.allowed_tables")
 
     # DEFECT: check_access() plans every statement with EXPLAIN FORMAT=JSON, but
     # SHOW and DESCRIBE cannot be planned, so setting an allowlist makes the
