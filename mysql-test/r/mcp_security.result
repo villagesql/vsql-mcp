@@ -79,7 +79,7 @@ schema_reject_whitespace_dot_tab: PASS
 schema_reject_whitespace_dot_newline: PASS
 schema_reject_whitespace_dot_backtick_space: PASS
 schema_reject_whitespace_dot_comment: PASS
-known_schema_bypass_via_view: PASS
+known_view_reaches_through_schema_scope: PASS
 schema_allows_alias_qualified_column: PASS
 schema_allows_explicit_as_alias: PASS
 schema_allows_table_qualified_column: PASS

@@ -192,10 +192,17 @@ def schema_scope():
         _, err = C.tool(sid, "query", {"sql": sql})
         C.rejected("schema_reject_whitespace_dot_" + name, err, "outside the exposed schema")
 
-    # DEFECT: scoping reads the submitted text only, so a view inside the
-    # exposed schema is an unchecked door into any schema it was defined over.
+    # Scoping reads the submitted statement, so a view inside the exposed schema
+    # reaches through to whatever it was defined over. That is how SQL intends a
+    # view to work — it is a delegation by whoever created it — and the README
+    # says so, pointing at allowed_tables for confinement that holds through a
+    # view. Pinned because it is a decision, and a future change to it should be
+    # deliberate rather than incidental.
     rows = C.query_rows(sid, "SELECT tag FROM mcpsec.v_leak")
-    C.ok("known_schema_bypass_via_view", rows == [{"tag": "other-schema-row"}], rows)
+    # The allowlist is the check that does hold through a view; that is asserted
+    # where it applies, by allowlist_reject_view_over_non_allowed.
+    C.ok("known_view_reaches_through_schema_scope",
+         rows == [{"tag": "other-schema-row"}], rows)
 
     # A qualifier is only a schema when it is not a name the statement binds.
     # Aliases and table-qualified columns are ordinary SQL and must work, or the
