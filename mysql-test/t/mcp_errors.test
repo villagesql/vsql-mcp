@@ -251,7 +251,14 @@ SET GLOBAL vsql_mcp.db_url = 'mysql://mcpuser@127.0.0.1:59999';
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port not_configured refused
 
 --echo # --- db_url has the wrong password ---
+# Offering a password to caching_sha2_password over a plain TCP connection makes
+# the server log an error of its own before refusing the login. That is the
+# server behaving normally, not this extension misbehaving, but MTR fails a test
+# whose run leaves unexpected errors in the log — and it only appears where the
+# server has no auto-generated RSA keypair, which is why it showed up on CI and
+# not on a developer machine.
 --disable_query_log
+CALL mtr.add_suppression("Plugin caching_sha2_password reported");
 --eval SET GLOBAL vsql_mcp.db_url = CONCAT('mysql://mcpuser:wrongpw@127.0.0.1:', @@port)
 --enable_query_log
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port not_configured denied
