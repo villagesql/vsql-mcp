@@ -119,21 +119,29 @@ def roundtrip():
     non_null = [k for k, v in nulls.items() if k != "id" and v is not None]
     C.ok("all_null_row_is_all_json_null", non_null == [], non_null)
 
-    # DEFECT: hex encoding is chosen by whether the bytes decode as UTF-8, not
-    # by whether the column is binary. A BIT/GEOMETRY value made only of bytes
-    # that happen to be valid UTF-8 takes the text branch instead, so the same
-    # column returns "0xaa" in one row and a raw control character in another.
-    C.ok("known_binary_valid_utf8_not_hex_encoded", b["bt"] == "\x00", repr(b["bt"]))
-    C.ok("known_geometry_valid_utf8_not_hex_encoded",
-         isinstance(b["geo"], str) and not b["geo"].startswith("0x")
-         and "\x00" in b["geo"], repr(b["geo"])[:60])
+    # Hex encoding follows the column's declared type, not whether the bytes
+    # happen to decode as UTF-8. A BIT or GEOMETRY value made only of bytes that
+    # are valid UTF-8 is still binary, so the same column renders the same way
+    # in every row rather than hex in one and control characters in the next.
+    C.ok("binary_valid_utf8_still_hex_encoded", b["bt"] == "0x00", repr(b["bt"]))
+    C.ok("geometry_valid_utf8_still_hex_encoded",
+         b["geo"].startswith("0x0000000001010000"), repr(b["geo"])[:60])
+    C.ok("binary_rendering_consistent_across_rows",
+         a["bt"].startswith("0x") and b["bt"].startswith("0x"), (a["bt"], b["bt"]))
+    C.ok("binary_rendering_consistent_for_geometry",
+         a["geo"].startswith("0x") and b["geo"].startswith("0x"), (a["geo"][:12], b["geo"][:12]))
 
-    # DEFECT: the zero DATETIME loses its time component, coming back as a bare
-    # date. The zero DATE is unaffected because it has none.
-    C.ok("known_zero_datetime_loses_time_part", b["dtm"] == "0000-00-00", b["dtm"])
+    # A DATETIME keeps its time part even when every field of it is zero. The
+    # driver drops it for any midnight value, so this covers the whole class,
+    # not just the zero date. A DATE has no time part to keep.
+    C.ok("zero_datetime_keeps_time_part", b["dtm"] == "0000-00-00 00:00:00", b["dtm"])
     C.ok("zero_date_value", b["dt"] == "0000-00-00", b["dt"])
 
-    C.ok("empty_string_not_null", b["txt"] == "" and b["bl"] == "", (b["txt"], b["bl"]))
+    # An empty text value stays an empty string; an empty binary value is an
+    # empty hex string, so a consumer decoding "0x..." gets zero bytes rather
+    # than a type change.
+    C.ok("empty_text_is_empty_string", b["txt"] == "", repr(b["txt"]))
+    C.ok("empty_binary_is_empty_hex", b["bl"] == "0x", repr(b["bl"]))
 
 
 def wide():

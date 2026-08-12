@@ -11,8 +11,9 @@ use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::time::Duration;
 
+use mysql::consts::ColumnType;
 use mysql::prelude::{Protocol, Queryable};
-use mysql::{Conn, Opts, OptsBuilder, Value as MyValue};
+use mysql::{Column, Conn, Opts, OptsBuilder, Value as MyValue};
 use serde_json::{Map, Value as Json};
 
 pub struct Rows {
@@ -231,12 +232,11 @@ fn collect<T: Protocol>(
     mut result: mysql::QueryResult<'_, '_, '_, T>,
     max_rows: usize,
 ) -> Result<Rows, String> {
-    let columns: Vec<String> = result
-        .columns()
-        .as_ref()
-        .iter()
-        .map(|c| c.name_str().into_owned())
-        .collect();
+    // Keep the column metadata, not just the names: how a value should be
+    // rendered depends on the column's declared type, and the row itself does
+    // not carry it.
+    let meta: Vec<Column> = result.columns().as_ref().to_vec();
+    let columns: Vec<String> = meta.iter().map(|c| c.name_str().into_owned()).collect();
 
     let mut rows = Vec::new();
     let mut truncated = false;
@@ -248,7 +248,7 @@ fn collect<T: Protocol>(
             // server-side SQL_SELECT_LIMIT this loop sees at most one extra row.
             continue;
         }
-        rows.push(row_to_json(row, &columns));
+        rows.push(row_to_json(row, &columns, &meta));
     }
 
     Ok(Rows {
@@ -258,29 +258,74 @@ fn collect<T: Protocol>(
     })
 }
 
-fn row_to_json(row: mysql::Row, columns: &[String]) -> Json {
+fn row_to_json(row: mysql::Row, columns: &[String], meta: &[Column]) -> Json {
     let mut obj = Map::with_capacity(columns.len());
     // Consume the row's values instead of cloning each cell.
-    for (name, cell) in columns.iter().zip(row.unwrap()) {
-        obj.insert(name.clone(), value_to_json(cell));
+    for ((name, cell), col) in columns.iter().zip(row.unwrap()).zip(meta) {
+        obj.insert(name.clone(), value_to_json(cell, col));
     }
     Json::Object(obj)
 }
 
-fn value_to_json(v: MyValue) -> Json {
+/// Whether a column holds bytes rather than text, and so should be hex-encoded
+/// whatever those bytes happen to be.
+///
+/// Deciding this by whether the bytes parse as UTF-8 gets it wrong per row: a
+/// BIT or GEOMETRY value made only of bytes that are valid UTF-8 came back as
+/// raw control characters while the next row of the same column came back as
+/// hex, and nothing in the response said which. The column's declared type is
+/// the same for every row, so it is the thing to ask.
+fn is_binary_column(col: &Column) -> bool {
+    // The binary "character set", which is how MySQL marks a string column as
+    // holding bytes.
+    const BINARY_CHARSET: u16 = 63;
+    match col.column_type() {
+        ColumnType::MYSQL_TYPE_BIT | ColumnType::MYSQL_TYPE_GEOMETRY => true,
+        // JSON is always text, and carries the binary charset on some server
+        // versions, so it has to be excluded before the charset test below.
+        ColumnType::MYSQL_TYPE_JSON => false,
+        ColumnType::MYSQL_TYPE_TINY_BLOB
+        | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+        | ColumnType::MYSQL_TYPE_LONG_BLOB
+        | ColumnType::MYSQL_TYPE_BLOB
+        | ColumnType::MYSQL_TYPE_STRING
+        | ColumnType::MYSQL_TYPE_VAR_STRING
+        | ColumnType::MYSQL_TYPE_VARCHAR => col.character_set() == BINARY_CHARSET,
+        _ => false,
+    }
+}
+
+fn value_to_json(v: MyValue, col: &Column) -> Json {
     match v {
         MyValue::NULL => Json::Null,
         MyValue::Int(i) => Json::from(i),
         MyValue::UInt(u) => Json::from(u),
         MyValue::Float(f) => Json::from(f),
         MyValue::Double(d) => Json::from(d),
-        MyValue::Bytes(b) => match String::from_utf8(b) {
-            Ok(s) => Json::String(s),
-            // Non-UTF-8 (true binary) — render as a lossless hex string rather
-            // than dropping bytes or emitting invalid JSON.
-            Err(e) => Json::String(format!("0x{}", hex(e.as_bytes()))),
-        },
-        // Date and time render as their canonical SQL string form.
+        MyValue::Bytes(b) => {
+            if is_binary_column(col) {
+                return Json::String(format!("0x{}", hex(&b)));
+            }
+            match String::from_utf8(b) {
+                Ok(s) => Json::String(s),
+                // A text column holding bytes that are not valid UTF-8 would
+                // otherwise have to lose them; hex keeps the value whole.
+                Err(e) => Json::String(format!("0x{}", hex(e.as_bytes()))),
+            }
+        }
+        // A date-typed value carries a time whether or not it is used, so the
+        // driver's rendering drops the time part for any DATETIME at midnight,
+        // the zero datetime included. The column type says which it is.
+        MyValue::Date(y, m, d, h, min, s, us) => {
+            if col.column_type() == ColumnType::MYSQL_TYPE_DATE {
+                Json::String(format!("{y:04}-{m:02}-{d:02}"))
+            } else if us > 0 {
+                Json::String(format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}.{us:06}"))
+            } else {
+                Json::String(format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}"))
+            }
+        }
+        // TIME renders as its canonical SQL string form, negatives included.
         other => Json::String(other.as_sql(true).trim_matches('\'').to_owned()),
     }
 }

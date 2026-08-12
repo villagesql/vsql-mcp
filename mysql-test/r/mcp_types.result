@@ -69,11 +69,14 @@ set_value: PASS
 utf8mb4_emoji_roundtrip: PASS
 quotes_and_backslash_roundtrip: PASS
 all_null_row_is_all_json_null: PASS
-known_binary_valid_utf8_not_hex_encoded: PASS
-known_geometry_valid_utf8_not_hex_encoded: PASS
-known_zero_datetime_loses_time_part: PASS
+binary_valid_utf8_still_hex_encoded: PASS
+geometry_valid_utf8_still_hex_encoded: PASS
+binary_rendering_consistent_across_rows: PASS
+binary_rendering_consistent_for_geometry: PASS
+zero_datetime_keeps_time_part: PASS
 zero_date_value: PASS
-empty_string_not_null: PASS
+empty_text_is_empty_string: PASS
+empty_binary_is_empty_hex: PASS
 # --- wide values and many columns ---
 wide_value_returned: PASS
 wide_value_length_3mb: PASS
