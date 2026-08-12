@@ -105,6 +105,7 @@ SET GLOBAL vsql_mcp.schema = 'mcpsec';
 resource_respects_schema_scope: PASS
 resource_refuses_system_schema: PASS
 resource_scope_case_insensitive: PASS
+resource_scope_case_not_a_scope_rejection: PASS
 resources_list_scoped_to_one_schema: PASS
 SET GLOBAL vsql_mcp.schema = '';
 # --- JSON-RPC framing ---

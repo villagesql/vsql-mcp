@@ -262,9 +262,19 @@ def scoped_resources():
          and "outside the exposed schema" in body["error"]["message"], body)
     st, body, _ = C.rpc(sid, "resources/read", {"uri": "vsql://mysql/user"})
     C.ok("resource_refuses_system_schema", is_rpc_error(body, -32602), body)
-    # Scope matching is case-insensitive on the schema name.
+    # Scope matching is case-insensitive on the schema name, so a differently
+    # cased name is not treated as a different schema. Whether it then RESOLVES
+    # is the server's business and platform-dependent: schema names are
+    # case-sensitive where the data directory is (Linux) and not where it is not
+    # (macOS). So the portable assertion is that the guardrail let it through —
+    # an unknown-database error from the server is a pass, a scope rejection is
+    # not.
     st, body, _ = C.rpc(sid, "resources/read", {"uri": "vsql://MCPSEC/t1"})
-    C.ok("resource_scope_case_insensitive", "result" in body, body)
+    message = (body or {}).get("error", {}).get("message", "")
+    C.ok("resource_scope_case_insensitive",
+         "result" in body or "Unknown database" in message, body)
+    C.ok("resource_scope_case_not_a_scope_rejection",
+         "outside the exposed schema" not in message, body)
     st, body, _ = C.rpc(sid, "resources/list")
     uris = [r["uri"] for r in body["result"]["resources"]]
     C.ok("resources_list_scoped_to_one_schema",
