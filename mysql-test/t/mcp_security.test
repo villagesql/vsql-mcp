@@ -197,14 +197,33 @@ def schema_scope():
     rows = C.query_rows(sid, "SELECT tag FROM mcpsec.v_leak")
     C.ok("known_schema_bypass_via_view", rows == [{"tag": "other-schema-row"}], rows)
 
-    # DEFECT: any '<alias>.<column>' is read as a schema qualifier, so ordinary
-    # aliased SQL is refused, and the message names the alias as if it were a
-    # schema. The loopback session has no default database either, so an
-    # unqualified table name cannot be used as the workaround.
-    _, err = C.tool(sid, "query", {"sql": "SELECT p.name FROM mcpsec.t1 p WHERE p.id=1"})
-    C.ok("known_alias_qualified_column_rejected", "schema 'p' is outside" in err, err[:140])
-    _, err = C.tool(sid, "query", {"sql": "SELECT t1.name FROM mcpsec.t1 WHERE t1.id=1"})
-    C.ok("known_table_qualified_column_rejected", "schema 't1' is outside" in err, err[:140])
+    # A qualifier is only a schema when it is not a name the statement binds.
+    # Aliases and table-qualified columns are ordinary SQL and must work, or the
+    # setting rules out every join.
+    rows = C.query_rows(sid, "SELECT p.name FROM mcpsec.t1 p WHERE p.id=1")
+    C.ok("schema_allows_alias_qualified_column", rows == [{"name": "alpha"}], rows)
+    rows = C.query_rows(sid, "SELECT p.name FROM mcpsec.t1 AS p WHERE p.id=1")
+    C.ok("schema_allows_explicit_as_alias", rows == [{"name": "alpha"}], rows)
+    rows = C.query_rows(sid, "SELECT t1.name FROM mcpsec.t1 WHERE t1.id=1")
+    C.ok("schema_allows_table_qualified_column", rows == [{"name": "alpha"}], rows)
+    rows = C.query_rows(sid,
+        "SELECT a.name FROM mcpsec.t1 a JOIN mcpsec.t1 b ON a.id=b.id WHERE a.id=1")
+    C.ok("schema_allows_self_join_with_aliases", rows == [{"name": "alpha"}], rows)
+
+    # Broadening for aliases must not open a door. A qualifier the statement
+    # does not bind is still checked, which is what catches a call into another
+    # schema's stored routine.
+    _, err = C.tool(sid, "query", {"sql": "SELECT mcpalt.some_function() AS x"})
+    C.rejected("schema_rejects_foreign_function_call", err, "outside the exposed schema")
+    _, err = C.tool(sid, "query", {"sql": "SELECT tag FROM mcpalt.t1 mcpalt"})
+    C.rejected("schema_rejects_table_aliased_to_its_own_schema", err,
+               "outside the exposed schema")
+
+    # The rejection says what to do instead. The loopback session has no default
+    # database, so dropping the qualifier is not the answer.
+    _, err = C.tool(sid, "query", {"sql": "SELECT tag FROM mcpalt.t1"})
+    C.ok("schema_rejection_names_the_exposed_schema", "only 'mcpsec' is available" in err, err[:180])
+    C.ok("schema_rejection_says_to_qualify", "must be qualified" in err, err[:180])
     _, err = C.tool(sid, "query", {"sql": "SELECT name FROM t1 WHERE id=1"})
     C.ok("known_unqualified_name_has_no_default_db", "1046" in err, err[:140])
 

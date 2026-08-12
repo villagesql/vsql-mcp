@@ -126,7 +126,15 @@ Applied to every `query`, `explain`, and `write` call:
   `db_url` an account whose grants match the blast radius you are willing to
   accept.
 - **Schema scoping.** With `schema` set, a reference to any other schema is
-  rejected.
+  rejected. Table names must be qualified with the exposed schema
+  (`mydb.orders`): the loopback connection has no default database, so a bare
+  name does not resolve. Aliases and table-qualified columns work normally —
+  `p.total` is a column, not a schema.
+
+  Scoping reads the statement, so a view inside the exposed schema that selects
+  from another one is reachable through it, as SQL intends for a view. Use
+  `allowed_tables` when you need confinement that holds through a view: that
+  check plans the statement and sees the underlying table.
 - **Table allowlist.** With `allowed_tables` set, the statement is planned with
   `EXPLAIN FORMAT=JSON` and every table it touches (joins and subqueries
   included) must be on the list. When the optimizer answers without naming a

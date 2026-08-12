@@ -270,7 +270,14 @@ fn check_access(sql: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Res
         ));
     }
     if let Some(bad) = guardrails::schema_violation(sql, &cfg.schema) {
-        return Err(format!("schema '{bad}' is outside the exposed schema"));
+        // Say what to do about it: the loopback session has no default
+        // database, so the way out is to qualify with the exposed schema, not
+        // to drop the qualifier.
+        return Err(format!(
+            "schema '{bad}' is outside the exposed schema; only '{}' is \
+             available, and table names must be qualified with it",
+            cfg.schema
+        ));
     }
     if cfg.allowed_tables.is_empty() {
         return Ok(());

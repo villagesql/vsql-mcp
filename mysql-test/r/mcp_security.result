@@ -80,8 +80,14 @@ schema_reject_whitespace_dot_newline: PASS
 schema_reject_whitespace_dot_backtick_space: PASS
 schema_reject_whitespace_dot_comment: PASS
 known_schema_bypass_via_view: PASS
-known_alias_qualified_column_rejected: PASS
-known_table_qualified_column_rejected: PASS
+schema_allows_alias_qualified_column: PASS
+schema_allows_explicit_as_alias: PASS
+schema_allows_table_qualified_column: PASS
+schema_allows_self_join_with_aliases: PASS
+schema_rejects_foreign_function_call: PASS
+schema_rejects_table_aliased_to_its_own_schema: PASS
+schema_rejection_names_the_exposed_schema: PASS
+schema_rejection_says_to_qualify: PASS
 known_unqualified_name_has_no_default_db: PASS
 SET GLOBAL vsql_mcp.schema = '';
 # --- table allowlist ---

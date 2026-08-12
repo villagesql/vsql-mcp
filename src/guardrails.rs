@@ -183,14 +183,48 @@ fn has_trailing_statement(sql: &str) -> bool {
 }
 
 /// When a schema is configured, reject any `schema.` qualifier that names a
-/// different schema. Table names may be unqualified (resolved in the configured
-/// schema) or qualified with the configured schema itself. Qualifiers inside
-/// string/backtick literals are ignored.
+/// different schema. Table names must be qualified with the configured schema:
+/// the loopback session has no default database, so an unqualified name does
+/// not resolve.
+///
+/// Not every `x.y` is a schema reference. `p.name` qualifies a column with a
+/// table alias and `t1.id` with a table, and reading those as schemas made
+/// ordinary aliased SQL unusable whenever this setting was on. Names the
+/// statement itself binds — the tables it selects from and the aliases it gives
+/// them — are therefore excluded before the comparison.
+///
+/// The check stays deliberately broad otherwise, so a qualifier that is not a
+/// table or alias is still tested. That is what keeps a call into another
+/// schema's stored function (`otherdb.some_function()`) from slipping by.
+/// Qualifiers inside string and backtick literals are ignored throughout.
 pub fn schema_violation(sql: &str, configured: &str) -> Option<String> {
     if configured.is_empty() {
         return None;
     }
+    let refs = table_refs(sql);
+
+    // A qualifier in table position is a schema, whatever else the statement
+    // binds. Testing these first means an alias cannot mask one: without this,
+    // `FROM otherdb.t otherdb` binds the very name that qualifies it.
+    for r in &refs {
+        if let Some(schema) = &r.schema {
+            if !schema.eq_ignore_ascii_case(configured) {
+                return Some(schema.clone());
+            }
+        }
+    }
+
+    let mut bound: Vec<String> = Vec::new();
+    for r in refs {
+        bound.push(r.table);
+        if let Some(alias) = r.alias {
+            bound.push(alias);
+        }
+    }
     for (schema, _table) in qualified_refs(sql) {
+        if bound.iter().any(|b| b.eq_ignore_ascii_case(&schema)) {
+            continue;
+        }
         if !schema.eq_ignore_ascii_case(configured) {
             return Some(schema);
         }
@@ -287,19 +321,46 @@ fn skip_gap(sql: &str, start: usize) -> usize {
     }
 }
 
-/// Table names appearing in table position in the statement text: the
-/// identifier after `FROM`, `JOIN`, `INTO`, `UPDATE` or `TABLE`, with a
-/// `schema.` qualifier dropped so the result matches what `EXPLAIN` reports.
-///
-/// This is a fallback for the case where the optimizer answers a query without
-/// naming a table, so `tables_in_explain` returns nothing and cannot speak for
-/// what was touched. It is deliberately eager: over-reporting a name costs a
-/// rejection, under-reporting one costs the allowlist.
+/// A table named in table position, with its `schema.` qualifier and the alias
+/// it was given, if it has either.
+pub struct TableRef {
+    pub schema: Option<String>,
+    pub table: String,
+    pub alias: Option<String>,
+}
+
+/// Bare table names in table position. See [`table_refs`].
 pub fn table_refs_in_text(sql: &str) -> Vec<String> {
+    table_refs(sql).into_iter().map(|r| r.table).collect()
+}
+
+/// Tables appearing in table position in the statement text: the identifier
+/// after `FROM`, `JOIN`, `INTO`, `UPDATE` or `TABLE`, with a `schema.`
+/// qualifier dropped so the result matches what `EXPLAIN` reports, plus the
+/// alias bound to it.
+///
+/// Two callers. The allowlist uses it as a fallback for the case where the
+/// optimizer answers without naming a table, so `tables_in_explain` cannot
+/// speak for what was touched. Schema scoping uses the names to tell a
+/// `schema.` qualifier apart from an alias or table qualifying one of its own
+/// columns.
+///
+/// Deliberately eager on the table side: over-reporting a name costs a
+/// rejection, under-reporting one costs the allowlist.
+pub fn table_refs(sql: &str) -> Vec<TableRef> {
     const TABLE_KEYWORDS: &[&str] = &["from", "join", "into", "update", "table"];
+    // Words that can follow a table reference without being an alias. Missing
+    // one costs a needless rejection; a schema named after one of these would
+    // be the only way to lose a check, which is not a case worth widening for.
+    const NOT_AN_ALIAS: &[&str] = &[
+        "on", "using", "where", "group", "order", "limit", "having", "join", "inner", "left",
+        "right", "full", "cross", "natural", "straight_join", "union", "set", "for", "into",
+        "values", "select", "and", "or", "not", "partition", "force", "use", "ignore", "with",
+        "window", "procedure", "lock", "offset", "as",
+    ];
 
     let bytes = sql.as_bytes();
-    let mut out = Vec::new();
+    let mut out: Vec<TableRef> = Vec::new();
     let mut i = 0;
     let mut in_single = false;
     let mut in_double = false;
@@ -351,20 +412,47 @@ pub fn table_refs_in_text(sql: &str) -> Vec<String> {
                     continue;
                 }
                 expect_table = false;
-                // `schema.table` keeps the right half, matching EXPLAIN.
+                if ident.is_empty() {
+                    continue;
+                }
+                // `schema.table` keeps the right half, matching EXPLAIN, and
+                // remembers the left so scoping can test it.
+                let mut schema = None;
+                let mut table = ident.to_ascii_lowercase();
                 let dot = skip_gap(sql, i);
                 if bytes.get(dot) == Some(&b'.') {
                     let right_start = skip_gap(sql, dot + 1);
                     let (right, ni2) = read_ident(sql, right_start);
                     if !right.is_empty() {
-                        out.push(right.to_ascii_lowercase());
+                        schema = Some(table);
+                        table = right.to_ascii_lowercase();
                         i = ni2;
-                        continue;
                     }
                 }
-                if !ident.is_empty() {
-                    out.push(ident.to_ascii_lowercase());
+                // An alias may follow, with or without AS. A word that cannot
+                // be an alias is left unconsumed, because some of them (JOIN)
+                // introduce the next table.
+                let mut alias = None;
+                let peek = skip_gap(sql, i);
+                let (next, after_next) = read_ident(sql, peek);
+                if next.eq_ignore_ascii_case("as") {
+                    let alias_start = skip_gap(sql, after_next);
+                    let (named, after_alias) = read_ident(sql, alias_start);
+                    if !named.is_empty() {
+                        alias = Some(named.to_ascii_lowercase());
+                        i = after_alias;
+                    }
+                } else if !next.is_empty()
+                    && !NOT_AN_ALIAS.iter().any(|k| next.eq_ignore_ascii_case(k))
+                {
+                    alias = Some(next.to_ascii_lowercase());
+                    i = after_next;
                 }
+                out.push(TableRef {
+                    schema,
+                    table,
+                    alias,
+                });
             }
             _ => {
                 // `FROM (SELECT ...)` is a derived table, not a name; the inner
