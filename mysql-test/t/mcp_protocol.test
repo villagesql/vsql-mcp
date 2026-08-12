@@ -1,0 +1,416 @@
+# vsql_mcp — MCP protocol compliance (spec revision 2025-06-18, Streamable HTTP).
+#
+# Covers the shapes mcp_basic does not: initialize negotiation, structural
+# validation of every advertised inputSchema, tools/call argument handling,
+# the resource URI surface including traversal, JSON-RPC framing errors, and
+# the transport rules.
+#
+# The distinction this file exists to police: a PROTOCOL error is a JSON-RPC
+# error object with a code, while a TOOL error is a successful JSON-RPC result
+# carrying isError. Returning one where the other belongs is a real defect, so
+# assertions here check which of the two came back, not merely that something
+# did.
+#
+# "known_" names pin current behaviour that departs from the spec or from what
+# an MCP client would expect; each is written up in the findings.
+
+--source mcp_env.inc
+--source mcp_client.inc
+
+--write_file $MYSQLTEST_VARDIR/tmp/mcp_proto.py
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import mcp_client as C
+
+C.configure(sys.argv[2])
+MODE = sys.argv[3]
+
+PROTOCOL = "2025-06-18"
+
+
+def is_rpc_error(body, code=None):
+    """True when the body is a JSON-RPC error object (optionally a given code)."""
+    if not isinstance(body, dict) or "error" not in body:
+        return False
+    return code is None or body["error"].get("code") == code
+
+
+def is_tool_error(body):
+    """True when the body is a successful result carrying isError."""
+    return (isinstance(body, dict) and "result" in body
+            and body["result"].get("isError") is True)
+
+
+def handshake():
+    # The advertised version is the one this server implements, echoed
+    # regardless of what the client asked for. The spec permits a server to
+    # answer with its own supported version.
+    st, body, hdr = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                               "params": {"protocolVersion": PROTOCOL, "capabilities": {}}})
+    res = (body or {}).get("result", {})
+    C.ok("init_status_200", st == 200, st)
+    C.ok("init_advertises_protocol_version", res.get("protocolVersion") == PROTOCOL, res)
+    C.ok("init_names_server", res.get("serverInfo", {}).get("name") == "vsql_mcp", res)
+    C.ok("init_reports_version", bool(res.get("serverInfo", {}).get("version")), res)
+    C.ok("init_declares_tools_capability", "tools" in res.get("capabilities", {}), res)
+    C.ok("init_declares_resources_capability", "resources" in res.get("capabilities", {}), res)
+    C.ok("init_issues_session_id", bool(hdr.get("Mcp-Session-Id")), hdr.get("Mcp-Session-Id"))
+
+    # A client asking for a version this server does not implement still gets
+    # 2025-06-18 back and a usable session, so a client that does not check the
+    # response version will proceed on a mismatch.
+    st, body, hdr = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                               "params": {"protocolVersion": "1999-01-01", "capabilities": {}}})
+    C.ok("known_init_ignores_client_protocol_version",
+         st == 200 and body["result"]["protocolVersion"] == PROTOCOL, body)
+
+    # Omitting params entirely, and omitting capabilities, are both accepted.
+    st, _, hdr = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+    C.ok("known_init_accepts_missing_params", st == 200 and bool(hdr.get("Mcp-Session-Id")), st)
+
+    # The MCP-Protocol-Version HEADER is validated, unlike the params field.
+    st, body, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                            proto="1999-01-01")
+    C.ok("init_rejects_unsupported_version_header",
+         st == 400 and is_rpc_error(body, -32600), (st, body))
+    # An absent header means "assume 2025-03-26", which the server accepts.
+    st, _, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                         proto=None)
+    C.ok("init_allows_absent_version_header", st == 200, st)
+    st, _, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                         proto="2025-03-26")
+    C.ok("init_accepts_prior_version_header", st == 200, st)
+
+    # Any other method before a session exists is refused, so initialize is
+    # effectively mandatory.
+    for method in ["tools/list", "tools/call", "resources/list", "ping"]:
+        st, body, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": method})
+        C.ok("pre_initialize_refused_" + method.replace("/", "_"),
+             st == 400 and is_rpc_error(body, -32600), (method, st))
+
+
+def tool_schemas():
+    """Every advertised tool must carry a name, a description an agent can act
+    on, and a structurally valid JSON Schema."""
+    sid = C.init()
+    st, body, _ = C.rpc(sid, "tools/list")
+    tools = body["result"]["tools"]
+
+    C.ok("tools_list_names", sorted(t["name"] for t in tools) ==
+         ["describe_table", "explain", "list_schemas", "list_tables", "query", "write"],
+         sorted(t["name"] for t in tools))
+
+    for t in tools:
+        n = t["name"]
+        schema = t.get("inputSchema", {})
+        props = schema.get("properties", {})
+        required = schema.get("required", [])
+        C.ok("schema_%s_has_description" % n, len(t.get("description", "")) >= 20, t.get("description"))
+        C.ok("schema_%s_is_object" % n, schema.get("type") == "object", schema)
+        C.ok("schema_%s_properties_is_object" % n, isinstance(props, dict), props)
+        # Every required key must actually be declared as a property, or a
+        # client validating against the schema cannot satisfy it.
+        C.ok("schema_%s_required_subset_of_properties" % n,
+             set(required).issubset(set(props)), (required, sorted(props)))
+        # Every declared property needs a type a client can use.
+        C.ok("schema_%s_properties_typed" % n,
+             all(isinstance(v, dict) and "type" in v for v in props.values()), props)
+
+    # The tools that take SQL must require it; the browsing tools must not
+    # require anything.
+    by_name = {t["name"]: t for t in tools}
+    for n in ["query", "explain", "write"]:
+        C.ok("schema_%s_requires_sql" % n, by_name[n]["inputSchema"].get("required") == ["sql"],
+             by_name[n]["inputSchema"])
+    C.ok("schema_list_schemas_requires_nothing",
+         by_name["list_schemas"]["inputSchema"].get("required") in (None, []),
+         by_name["list_schemas"]["inputSchema"])
+
+
+def tool_args():
+    """tools/call argument handling. A bad argument is a tool error, not a
+    transport failure, and must never be a 500."""
+    sid = C.init()
+
+    def call(params):
+        return C.rpc(sid, "tools/call", params)
+
+    st, body, _ = call({"name": "query", "arguments": {}})
+    C.ok("args_missing_required_is_tool_error",
+         st == 200 and is_tool_error(body), (st, body))
+    C.ok("args_missing_required_names_the_argument",
+         "missing required argument: sql" in body["result"]["content"][0]["text"], body)
+
+    st, body, _ = call({"name": "nosuchtool", "arguments": {}})
+    C.ok("args_unknown_tool_is_tool_error", st == 200 and is_tool_error(body), (st, body))
+    C.ok("args_unknown_tool_names_it",
+         "unknown tool: nosuchtool" in body["result"]["content"][0]["text"], body)
+
+    # A wrong type and an explicit null both land on the same "missing"
+    # message, because the argument reader asks for a string and treats
+    # anything else as absent. It is a clean tool error, but it misdescribes
+    # what the caller did wrong, which is the kind of thing an agent retries
+    # blindly.
+    for name, args in [("wrong_type", {"sql": 123}), ("null", {"sql": None}),
+                       ("array", {"sql": ["SELECT 1"]})]:
+        st, body, _ = call({"name": "query", "arguments": args})
+        C.ok("known_args_%s_reported_as_missing" % name,
+             st == 200 and is_tool_error(body)
+             and "missing required argument" in body["result"]["content"][0]["text"],
+             (st, body))
+
+    # An unknown extra argument is ignored rather than refused, which is the
+    # tolerant reading and is fine.
+    st, body, _ = C.rpc(sid, "tools/call",
+                        {"name": "query", "arguments": {"sql": "SELECT 1 AS a", "bogus": 1}})
+    C.ok("args_extra_argument_ignored",
+         st == 200 and body["result"].get("isError") is False, body)
+
+    # An empty SQL string reaches the guardrail rather than the server.
+    st, body, _ = call({"name": "query", "arguments": {"sql": ""}})
+    C.ok("args_empty_sql_is_tool_error", is_tool_error(body), body)
+
+    # tools/call with no params at all degrades to an empty tool name.
+    st, body, _ = C.rpc(sid, "tools/call")
+    C.ok("known_toolscall_without_params_reports_empty_tool_name",
+         st == 200 and is_tool_error(body)
+         and body["result"]["content"][0]["text"] == "unknown tool: ", body)
+
+    # describe_table needs its required argument and reports a missing table
+    # as a tool error naming schema and table.
+    st, body, _ = call({"name": "describe_table", "arguments": {"schema": "mcpsec"}})
+    C.ok("args_describe_table_requires_table", is_tool_error(body), body)
+    st, body, _ = call({"name": "describe_table",
+                        "arguments": {"schema": "mcpsec", "table": "nosuch"}})
+    C.ok("args_describe_table_missing_table_message",
+         is_tool_error(body)
+         and "table not found: mcpsec.nosuch" in body["result"]["content"][0]["text"], body)
+
+
+def resources():
+    sid = C.init()
+
+    st, body, _ = C.rpc(sid, "resources/list")
+    res = body["result"]["resources"]
+    C.ok("resources_list_returns_entries", len(res) > 0, len(res))
+    C.ok("resources_list_entries_well_formed",
+         all("uri" in r and "name" in r and "mimeType" in r for r in res), res[:2])
+    C.ok("resources_list_uris_are_vsql_scheme",
+         all(r["uri"].startswith("vsql://") for r in res), res[:2])
+
+    def read(uri):
+        return C.rpc(sid, "resources/read", {"uri": uri})
+
+    st, body, _ = read("vsql://mcpsec/t1")
+    text = body["result"]["contents"][0]["text"]
+    C.ok("resource_table_returns_ddl", "CREATE TABLE" in text and "`t1`" in text, text[:80])
+    C.ok("resource_table_echoes_uri",
+         body["result"]["contents"][0]["uri"] == "vsql://mcpsec/t1", body)
+
+    st, body, _ = read("vsql://mcpsec")
+    text = body["result"]["contents"][0]["text"]
+    C.ok("resource_schema_lists_tables", "t1" in text and "secret" in text, text[:80])
+
+    # A missing table is a JSON-RPC error, which is the right shape for
+    # resources/read.
+    st, body, _ = read("vsql://mcpsec/nosuchtable")
+    C.ok("resource_missing_table_is_rpc_error", is_rpc_error(body, -32602), body)
+
+    # Traversal: the path segment is backtick-quoted as an identifier, so it is
+    # taken literally and cannot climb out. The error naming the literal string
+    # is the proof it was never interpreted as a path.
+    st, body, _ = read("vsql://mcpsec/../mcpalt/t1")
+    C.ok("resource_traversal_contained", is_rpc_error(body, -32602)
+         and "mcpsec.../mcpalt/t1" in body["error"]["message"], body)
+    st, body, _ = read("vsql://mcpsec/t1/extra")
+    C.ok("resource_extra_path_segment_contained", is_rpc_error(body, -32602)
+         and "mcpsec.t1/extra" in body["error"]["message"], body)
+
+    # Percent-encoding is not decoded, so an encoded separator stays part of the
+    # name and fails closed rather than resolving to a table.
+    st, body, _ = read("vsql://mcpsec%2Ft1")
+    C.ok("known_resource_percent_encoding_not_decoded",
+         "result" in body and "mcpsec%2Ft1" in body["result"]["contents"][0]["text"], body)
+
+    # A non-vsql scheme and an empty schema are both refused.
+    st, body, _ = read("http://mcpsec/t1")
+    C.ok("resource_foreign_scheme_refused", is_rpc_error(body, -32602)
+         and "unsupported resource URI" in body["error"]["message"], body)
+    st, body, _ = read("vsql://")
+    C.ok("resource_missing_schema_refused", is_rpc_error(body, -32602), body)
+    st, body, _ = C.rpc(sid, "resources/read", {})
+    C.ok("resource_missing_uri_param_refused", is_rpc_error(body, -32602)
+         and "missing required parameter: uri" in body["error"]["message"], body)
+
+    # A schema that does not exist reads as an empty schema rather than an
+    # error, so a client cannot tell "no tables" from "no such schema".
+    st, body, _ = read("vsql://nosuchschema")
+    C.ok("known_resource_unknown_schema_reads_as_empty",
+         "result" in body and "(none)" in body["result"]["contents"][0]["text"], body)
+
+
+def scoped_resources():
+    """With vsql_mcp.schema set, resources must not reach another schema."""
+    sid = C.init()
+    st, body, _ = C.rpc(sid, "resources/read", {"uri": "vsql://mcpalt/t1"})
+    C.ok("resource_respects_schema_scope", is_rpc_error(body, -32602)
+         and "outside the exposed schema" in body["error"]["message"], body)
+    st, body, _ = C.rpc(sid, "resources/read", {"uri": "vsql://mysql/user"})
+    C.ok("resource_refuses_system_schema", is_rpc_error(body, -32602), body)
+    # Scope matching is case-insensitive on the schema name.
+    st, body, _ = C.rpc(sid, "resources/read", {"uri": "vsql://MCPSEC/t1"})
+    C.ok("resource_scope_case_insensitive", "result" in body, body)
+    st, body, _ = C.rpc(sid, "resources/list")
+    uris = [r["uri"] for r in body["result"]["resources"]]
+    C.ok("resources_list_scoped_to_one_schema",
+         all(u.startswith("vsql://mcpsec") for u in uris), uris[:4])
+
+
+def framing():
+    """JSON-RPC framing. These are protocol errors and must come back as
+    JSON-RPC error objects, not as tool results."""
+    sid = C.init()
+
+    st, body, _ = C.request(raw=b'{"jsonrpc":"2.0","id":1,', headers={"Mcp-Session-Id": sid})
+    C.ok("framing_malformed_json_is_parse_error",
+         st == 400 and is_rpc_error(body, -32700), (st, body))
+
+    st, body, _ = C.request(raw=b'', headers={"Mcp-Session-Id": sid})
+    C.ok("framing_empty_body_rejected", st in (400, 202), st)
+
+    st, body, _ = C.rpc(sid, None) if False else C.request(
+        {"jsonrpc": "2.0", "id": 1}, headers={"Mcp-Session-Id": sid})
+    C.ok("framing_missing_method_is_invalid_request",
+         st == 400 and is_rpc_error(body, -32600), (st, body))
+
+    st, body, _ = C.rpc(sid, "nosuch/method")
+    C.ok("framing_unknown_method_is_method_not_found",
+         st == 200 and is_rpc_error(body, -32601), (st, body))
+
+    # A notification carries no id and gets an acknowledgement with no body,
+    # which is what the Streamable HTTP transport prescribes.
+    st, body, _ = C.request({"jsonrpc": "2.0", "method": "ping"},
+                            headers={"Mcp-Session-Id": sid})
+    C.ok("framing_notification_acknowledged_202", st == 202 and body is None, (st, body))
+
+    # 2025-06-18 REMOVED JSON-RPC batching, so a batch must be refused. It is
+    # instead swallowed as if it were a notification: 202, no body, nothing
+    # executed and nothing reported.
+    st, body, _ = C.request([{"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                             {"jsonrpc": "2.0", "id": 2, "method": "ping"}],
+                            headers={"Mcp-Session-Id": sid})
+    C.ok("known_framing_batch_silently_accepted_202", st == 202 and body is None, (st, body))
+
+    # The jsonrpc member is never validated, so a 1.0 or absent version is
+    # answered as though it were 2.0.
+    st, body, _ = C.request({"jsonrpc": "1.0", "id": 1, "method": "ping"},
+                            headers={"Mcp-Session-Id": sid})
+    C.ok("known_framing_wrong_jsonrpc_version_accepted",
+         st == 200 and "result" in body, (st, body))
+    st, body, _ = C.request({"id": 1, "method": "ping"}, headers={"Mcp-Session-Id": sid})
+    C.ok("known_framing_absent_jsonrpc_member_accepted",
+         st == 200 and "result" in body, (st, body))
+
+    # An explicit null id is a request as far as this server is concerned and
+    # is echoed back as null.
+    st, body, _ = C.request({"jsonrpc": "2.0", "id": None, "method": "ping"},
+                            headers={"Mcp-Session-Id": sid})
+    C.ok("known_framing_null_id_treated_as_request",
+         st == 200 and "result" in body and body["id"] is None, (st, body))
+
+    # Reusing an id is not tracked; each request is answered independently.
+    st, a, _ = C.rpc(sid, "ping", rid=7)
+    st, b, _ = C.rpc(sid, "ping", rid=7)
+    C.ok("framing_duplicate_id_answered_independently",
+         a.get("id") == 7 and b.get("id") == 7, (a, b))
+
+    # Every response carries the jsonrpc member and echoes the id.
+    st, body, _ = C.rpc(sid, "ping", rid=99)
+    C.ok("framing_response_shape", body.get("jsonrpc") == "2.0" and body.get("id") == 99, body)
+
+
+def transport():
+    sid = C.init()
+
+    st, _, _ = C.request(None, method="GET", headers={"Mcp-Session-Id": sid})
+    C.ok("transport_get_405", st == 405, st)
+    st, _, _ = C.request(None, method="PUT", headers={"Mcp-Session-Id": sid})
+    C.ok("transport_put_405", st == 405, st)
+    st, _, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                         headers={"Mcp-Session-Id": sid}, path="/nope")
+    C.ok("transport_unknown_path_404", st == 404, st)
+    st, body, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                            headers={"Mcp-Session-Id": sid}, path="/")
+    C.ok("transport_root_path_served", st == 200 and "result" in body, st)
+    st, body, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                            headers={"Mcp-Session-Id": sid}, path="/mcp?x=1")
+    C.ok("transport_query_string_ignored", st == 200 and "result" in body, st)
+
+    # The spec tells clients to send both an Accept listing application/json and
+    # text/event-stream and a JSON content type. Neither is enforced, so a
+    # non-conforming client is served anyway. Lenient, not dangerous, but it
+    # means the server cannot be used to detect a broken client.
+    st, body, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                            headers={"Mcp-Session-Id": sid}, content_type="text/plain")
+    C.ok("known_transport_content_type_not_enforced", st == 200 and "result" in body, st)
+    st, body, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                            headers={"Mcp-Session-Id": sid}, accept=None)
+    C.ok("known_transport_accept_not_enforced", st == 200 and "result" in body, st)
+
+    # The body cap is enforced before any parsing.
+    big = "x" * (1024 * 1024 + 64)
+    st, _, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                          "params": {"pad": big}})
+    C.ok("transport_oversized_body_413", st == 413, st)
+    # A body just under the cap is still served.
+    st, body, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                             "params": {"pad": "x" * 1000}})
+    C.ok("transport_large_but_legal_body_ok", st == 200, st)
+
+    # DELETE is the session teardown verb.
+    st, _, _ = C.request(None, method="DELETE")
+    C.ok("transport_delete_without_session_400", st == 400, st)
+    st, _, _ = C.request(None, method="DELETE", headers={"Mcp-Session-Id": "nosuchsession"})
+    C.ok("transport_delete_unknown_session_404", st == 404, st)
+    st, _, _ = C.request(None, method="DELETE", headers={"Mcp-Session-Id": sid})
+    C.ok("transport_delete_live_session_200", st == 200, st)
+
+    # Responses are declared as JSON.
+    st, body, hdr = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    C.ok("transport_response_content_type_json",
+         "application/json" in (hdr.get("Content-Type") or ""), hdr.get("Content-Type"))
+
+
+{"handshake": handshake, "schemas": tool_schemas, "args": tool_args,
+ "resources": resources, "scoped": scoped_resources, "framing": framing,
+ "transport": transport}[MODE]()
+EOF
+
+--echo # --- initialize / handshake ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_proto.py $MYSQLTEST_VARDIR/tmp $mcp_port handshake
+
+--echo # --- tools/list schema validation ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_proto.py $MYSQLTEST_VARDIR/tmp $mcp_port schemas
+
+--echo # --- tools/call argument handling ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_proto.py $MYSQLTEST_VARDIR/tmp $mcp_port args
+
+--echo # --- resources ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_proto.py $MYSQLTEST_VARDIR/tmp $mcp_port resources
+
+--echo # --- resources under a configured schema ---
+SET GLOBAL vsql_mcp.schema = 'mcpsec';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_proto.py $MYSQLTEST_VARDIR/tmp $mcp_port scoped
+SET GLOBAL vsql_mcp.schema = '';
+
+--echo # --- JSON-RPC framing ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_proto.py $MYSQLTEST_VARDIR/tmp $mcp_port framing
+
+--echo # --- transport rules ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_proto.py $MYSQLTEST_VARDIR/tmp $mcp_port transport
+
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_proto.py
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_client.py
+--source mcp_env_cleanup.inc

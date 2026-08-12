@@ -1,0 +1,145 @@
+INSTALL EXTENSION vsql_mcp;
+CREATE USER mcpuser@'127.0.0.1';
+GRANT SELECT, SHOW VIEW ON *.* TO mcpuser@'127.0.0.1';
+CREATE SCHEMA mcpsec;
+GRANT INSERT, UPDATE, DELETE ON mcpsec.* TO mcpuser@'127.0.0.1';
+CREATE TABLE mcpsec.t1 (id INT PRIMARY KEY, name VARCHAR(50));
+INSERT INTO mcpsec.t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+CREATE TABLE mcpsec.secret (id INT PRIMARY KEY, password_hash VARCHAR(80), KEY ix_ph (password_hash));
+INSERT INTO mcpsec.secret VALUES (1, 'hunter2hash');
+CREATE SCHEMA mcpalt;
+CREATE TABLE mcpalt.t1 (id INT PRIMARY KEY, tag VARCHAR(30));
+INSERT INTO mcpalt.t1 VALUES (1, 'other-schema-row');
+CREATE VIEW mcpsec.v_leak AS SELECT id, tag FROM mcpalt.t1;
+CREATE VIEW mcpsec.v_secret AS SELECT password_hash FROM mcpsec.secret;
+SET GLOBAL vsql_mcp.port = 0;
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+# --- initialize / handshake ---
+init_status_200: PASS
+init_advertises_protocol_version: PASS
+init_names_server: PASS
+init_reports_version: PASS
+init_declares_tools_capability: PASS
+init_declares_resources_capability: PASS
+init_issues_session_id: PASS
+known_init_ignores_client_protocol_version: PASS
+known_init_accepts_missing_params: PASS
+init_rejects_unsupported_version_header: PASS
+init_allows_absent_version_header: PASS
+init_accepts_prior_version_header: PASS
+pre_initialize_refused_tools_list: PASS
+pre_initialize_refused_tools_call: PASS
+pre_initialize_refused_resources_list: PASS
+pre_initialize_refused_ping: PASS
+# --- tools/list schema validation ---
+tools_list_names: PASS
+schema_list_schemas_has_description: PASS
+schema_list_schemas_is_object: PASS
+schema_list_schemas_properties_is_object: PASS
+schema_list_schemas_required_subset_of_properties: PASS
+schema_list_schemas_properties_typed: PASS
+schema_list_tables_has_description: PASS
+schema_list_tables_is_object: PASS
+schema_list_tables_properties_is_object: PASS
+schema_list_tables_required_subset_of_properties: PASS
+schema_list_tables_properties_typed: PASS
+schema_describe_table_has_description: PASS
+schema_describe_table_is_object: PASS
+schema_describe_table_properties_is_object: PASS
+schema_describe_table_required_subset_of_properties: PASS
+schema_describe_table_properties_typed: PASS
+schema_query_has_description: PASS
+schema_query_is_object: PASS
+schema_query_properties_is_object: PASS
+schema_query_required_subset_of_properties: PASS
+schema_query_properties_typed: PASS
+schema_explain_has_description: PASS
+schema_explain_is_object: PASS
+schema_explain_properties_is_object: PASS
+schema_explain_required_subset_of_properties: PASS
+schema_explain_properties_typed: PASS
+schema_write_has_description: PASS
+schema_write_is_object: PASS
+schema_write_properties_is_object: PASS
+schema_write_required_subset_of_properties: PASS
+schema_write_properties_typed: PASS
+schema_query_requires_sql: PASS
+schema_explain_requires_sql: PASS
+schema_write_requires_sql: PASS
+schema_list_schemas_requires_nothing: PASS
+# --- tools/call argument handling ---
+args_missing_required_is_tool_error: PASS
+args_missing_required_names_the_argument: PASS
+args_unknown_tool_is_tool_error: PASS
+args_unknown_tool_names_it: PASS
+known_args_wrong_type_reported_as_missing: PASS
+known_args_null_reported_as_missing: PASS
+known_args_array_reported_as_missing: PASS
+args_extra_argument_ignored: PASS
+args_empty_sql_is_tool_error: PASS
+known_toolscall_without_params_reports_empty_tool_name: PASS
+args_describe_table_requires_table: PASS
+args_describe_table_missing_table_message: PASS
+# --- resources ---
+resources_list_returns_entries: PASS
+resources_list_entries_well_formed: PASS
+resources_list_uris_are_vsql_scheme: PASS
+resource_table_returns_ddl: PASS
+resource_table_echoes_uri: PASS
+resource_schema_lists_tables: PASS
+resource_missing_table_is_rpc_error: PASS
+resource_traversal_contained: PASS
+resource_extra_path_segment_contained: PASS
+known_resource_percent_encoding_not_decoded: PASS
+resource_foreign_scheme_refused: PASS
+resource_missing_schema_refused: PASS
+resource_missing_uri_param_refused: PASS
+known_resource_unknown_schema_reads_as_empty: PASS
+# --- resources under a configured schema ---
+SET GLOBAL vsql_mcp.schema = 'mcpsec';
+resource_respects_schema_scope: PASS
+resource_refuses_system_schema: PASS
+resource_scope_case_insensitive: PASS
+resources_list_scoped_to_one_schema: PASS
+SET GLOBAL vsql_mcp.schema = '';
+# --- JSON-RPC framing ---
+framing_malformed_json_is_parse_error: PASS
+framing_empty_body_rejected: PASS
+framing_missing_method_is_invalid_request: PASS
+framing_unknown_method_is_method_not_found: PASS
+framing_notification_acknowledged_202: PASS
+known_framing_batch_silently_accepted_202: PASS
+known_framing_wrong_jsonrpc_version_accepted: PASS
+known_framing_absent_jsonrpc_member_accepted: PASS
+known_framing_null_id_treated_as_request: PASS
+framing_duplicate_id_answered_independently: PASS
+framing_response_shape: PASS
+# --- transport rules ---
+transport_get_405: PASS
+transport_put_405: PASS
+transport_unknown_path_404: PASS
+transport_root_path_served: PASS
+transport_query_string_ignored: PASS
+known_transport_content_type_not_enforced: PASS
+known_transport_accept_not_enforced: PASS
+transport_oversized_body_413: PASS
+transport_large_but_legal_body_ok: PASS
+transport_delete_without_session_400: PASS
+transport_delete_unknown_session_404: PASS
+transport_delete_live_session_200: PASS
+transport_response_content_type_json: PASS
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+SET GLOBAL vsql_mcp.schema = '';
+SET GLOBAL vsql_mcp.allowed_tables = '';
+SET GLOBAL vsql_mcp.allow_write = OFF;
+SET GLOBAL vsql_mcp.require_auth = OFF;
+SET GLOBAL vsql_mcp.bearer_token = '';
+SET GLOBAL vsql_mcp.max_rows = 1000;
+SET GLOBAL vsql_mcp.query_timeout = 30;
+SET GLOBAL vsql_mcp.db_url = '';
+DROP VIEW mcpsec.v_secret;
+DROP VIEW mcpsec.v_leak;
+DROP SCHEMA mcpalt;
+DROP SCHEMA mcpsec;
+DROP USER mcpuser@'127.0.0.1';
+UNINSTALL EXTENSION vsql_mcp;

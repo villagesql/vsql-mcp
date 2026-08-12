@@ -1,0 +1,134 @@
+INSTALL EXTENSION vsql_mcp;
+CREATE USER mcpuser@'127.0.0.1';
+GRANT SELECT, SHOW VIEW ON *.* TO mcpuser@'127.0.0.1';
+CREATE SCHEMA mcpsec;
+GRANT INSERT, UPDATE, DELETE ON mcpsec.* TO mcpuser@'127.0.0.1';
+CREATE TABLE mcpsec.t1 (id INT PRIMARY KEY, name VARCHAR(50));
+INSERT INTO mcpsec.t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+CREATE TABLE mcpsec.secret (id INT PRIMARY KEY, password_hash VARCHAR(80), KEY ix_ph (password_hash));
+INSERT INTO mcpsec.secret VALUES (1, 'hunter2hash');
+CREATE SCHEMA mcpalt;
+CREATE TABLE mcpalt.t1 (id INT PRIMARY KEY, tag VARCHAR(30));
+INSERT INTO mcpalt.t1 VALUES (1, 'other-schema-row');
+CREATE VIEW mcpsec.v_leak AS SELECT id, tag FROM mcpalt.t1;
+CREATE VIEW mcpsec.v_secret AS SELECT password_hash FROM mcpsec.secret;
+SET GLOBAL vsql_mcp.port = 0;
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+# --- loopback connections held by the extension before any load ---
+SELECT COUNT(*) AS mcpuser_connections FROM information_schema.processlist
+WHERE USER = 'mcpuser';
+mcpuser_connections
+0
+Warnings:
+Warning	1287	'INFORMATION_SCHEMA.PROCESSLIST' is deprecated and will be removed in a future release. Please use performance_schema.processlist instead
+# --- 50 concurrent tool calls ---
+fanout_all_answered: PASS
+fanout_no_crossed_responses: PASS
+fanout_completed_without_stalling: PASS
+fanout_sessions_all_issued: PASS
+fanout_sessions_all_distinct: PASS
+# --- connections after the burst: the extension opens one per call and closes it ---
+SELECT COUNT(*) AS mcpuser_connections FROM information_schema.processlist
+WHERE USER = 'mcpuser';
+mcpuser_connections
+0
+Warnings:
+Warning	1287	'INFORMATION_SCHEMA.PROCESSLIST' is deprecated and will be removed in a future release. Please use performance_schema.processlist instead
+# --- mixed fast and timing-out load ---
+SET GLOBAL vsql_mcp.query_timeout = 2;
+mixed_fast_calls_all_correct: PASS
+mixed_slow_calls_all_returned: PASS
+mixed_load_completed: PASS
+mixed_server_healthy_after: PASS
+SET GLOBAL vsql_mcp.query_timeout = 30;
+# --- connections after the timing-out burst ---
+SELECT COUNT(*) AS mcpuser_connections FROM information_schema.processlist
+WHERE USER = 'mcpuser';
+mcpuser_connections
+0
+Warnings:
+Warning	1287	'INFORMATION_SCHEMA.PROCESSLIST' is deprecated and will be removed in a future release. Please use performance_schema.processlist instead
+# --- disable the listener with a tool call in flight ---
+inflight_request_is_on_the_wire: PASS
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+# the disable completed while a call was outstanding
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+inflight_child_finished: PASS
+after_toggle_new_session_issued: PASS
+after_toggle_query_works: PASS
+# --- sessions do not survive a disable ---
+session_minted_before_disable: PASS
+SELECT VARIABLE_VALUE AS sessions_active_before_disable
+FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.sessions_active';
+sessions_active_before_disable
+2
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+SELECT VARIABLE_VALUE AS sessions_active_after_disable
+FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.sessions_active';
+sessions_active_after_disable
+0
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+session_from_before_disable_is_gone: PASS
+# --- 12 enable/disable cycles: rebinds every time, never deadlocks ---
+# the server answered SQL throughout and the listener is bound again
+SELECT 1 AS server_responsive;
+server_responsive
+1
+SELECT VARIABLE_VALUE > 0 AS listener_rebound
+FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+listener_rebound
+1
+SELECT VARIABLE_VALUE AS sessions_active_after_cycles
+FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.sessions_active';
+sessions_active_after_cycles
+0
+after_toggle_new_session_issued: PASS
+after_toggle_query_works: PASS
+# --- which settings apply without a rebind ---
+SET GLOBAL vsql_mcp.schema = 'mcpsec';
+live_schema_applies_without_restart: PASS
+SET GLOBAL vsql_mcp.schema = '';
+live_schema_cleared_without_restart: PASS
+SET GLOBAL vsql_mcp.allowed_tables = 't1';
+live_allowed_tables_applies_without_restart: PASS
+SET GLOBAL vsql_mcp.allowed_tables = '';
+SET GLOBAL vsql_mcp.max_rows = 2;
+live_max_rows_applies_without_restart: PASS
+SET GLOBAL vsql_mcp.max_rows = 1000;
+SET GLOBAL vsql_mcp.allow_write = ON;
+live_allow_write_applies_without_restart: PASS
+SET GLOBAL vsql_mcp.allow_write = OFF;
+DELETE FROM mcpsec.t1 WHERE id = 50;
+# port is a bind-time setting: changing it does not move the live listener
+SET GLOBAL vsql_mcp.port = 3199;
+live_port_unchanged_by_setting
+1
+SET GLOBAL vsql_mcp.port = 0;
+# --- status counters move by exactly the expected deltas ---
+counters_q1: PASS
+counters_q2: PASS
+counters_q3: PASS
+counters_two_errors: PASS
+counters_list_tables_ok: PASS
+# 6 tool calls: 3 queries (6 rows), 2 failures, 1 list_tables
+tool_calls_delta
+6
+tool_errors_delta
+2
+rows_returned_delta
+6
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+SET GLOBAL vsql_mcp.schema = '';
+SET GLOBAL vsql_mcp.allowed_tables = '';
+SET GLOBAL vsql_mcp.allow_write = OFF;
+SET GLOBAL vsql_mcp.require_auth = OFF;
+SET GLOBAL vsql_mcp.bearer_token = '';
+SET GLOBAL vsql_mcp.max_rows = 1000;
+SET GLOBAL vsql_mcp.query_timeout = 30;
+SET GLOBAL vsql_mcp.db_url = '';
+DROP VIEW mcpsec.v_secret;
+DROP VIEW mcpsec.v_leak;
+DROP SCHEMA mcpalt;
+DROP SCHEMA mcpsec;
+DROP USER mcpuser@'127.0.0.1';
+UNINSTALL EXTENSION vsql_mcp;

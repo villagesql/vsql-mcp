@@ -1,0 +1,220 @@
+# vsql_mcp — type serialization fidelity.
+#
+# The query tool uses the binary protocol, so values arrive typed and
+# executor::value_to_json decides how each becomes JSON. That function makes two
+# choices worth testing hard: numbers that JSON cannot hold exactly are emitted
+# as strings, and byte strings are hex-encoded only when they fail a UTF-8
+# decode. The second choice is the interesting one, because binary that happens
+# to decode as UTF-8 takes the other branch.
+#
+# Every assertion compares against a value inserted by MTR, so this is a real
+# round trip rather than a self-consistent reading of whatever came back.
+
+--source mcp_env.inc
+--source mcp_client.inc
+
+--echo # A row of every type that has an awkward JSON mapping, a row of all
+--echo # NULLs, and a row of boundary values.
+SET SESSION sql_mode = '';
+CREATE TABLE mcpsec.types1 (
+  id INT PRIMARY KEY,
+  dec_big DECIMAL(30,10), big_u BIGINT UNSIGNED, big_s BIGINT,
+  dbl DOUBLE, flt FLOAT,
+  dtm DATETIME(6), tstamp TIMESTAMP(6) NULL, dt DATE, tm TIME(6), yr YEAR,
+  js JSON, bl BLOB, vb VARBINARY(32), bt BIT(8),
+  en ENUM('a','b'), st SET('x','y'), geo GEOMETRY,
+  txt VARCHAR(200) CHARACTER SET utf8mb4
+);
+INSERT INTO mcpsec.types1 VALUES (
+  1, 12345678901234567890.1234567890, 18446744073709551615, -9223372036854775808,
+  1.7976931348623157e308, 3.4e38,
+  '2026-08-12 13:45:56.123456', '2026-08-12 13:45:56.123456', '2026-08-12',
+  '-838:59:58.999999', 2026,
+  '{"k":[1,2,{"n":null}]}', UNHEX('00FF80'), UNHEX('DEADBEEF'), b'10101010',
+  'b', 'x,y', ST_GeomFromText('POINT(1 2)'),
+  CONCAT('emoji ', CHAR(0xF09F9880 USING utf8mb4), ' q" b\\ t` nl')
+);
+INSERT INTO mcpsec.types1 (id) VALUES (2);
+INSERT INTO mcpsec.types1 VALUES (
+  3, 0, 9007199254740993, 9007199254740993, 0, 0,
+  '0000-00-00 00:00:00.000000', NULL, '0000-00-00', '00:00:00', 0,
+  'null', '', '', b'0', 'a', '', ST_GeomFromText('POINT(0 0)'), ''
+);
+
+--write_file $MYSQLTEST_VARDIR/tmp/mcp_types.py
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import mcp_client as C
+
+C.configure(sys.argv[2])
+MODE = sys.argv[3]
+
+
+def close(a, b, rel=1e-9):
+    return a is not None and abs(a - b) <= abs(b) * rel
+
+
+def roundtrip():
+    sid = C.init()
+    obj, err = C.jtool(sid, "query", {"sql": "SELECT * FROM mcpsec.types1 ORDER BY id"})
+    if obj is None:
+        C.ok("types_query_succeeded", False, err)
+        return
+    C.ok("types_query_succeeded", True)
+    rows = {r["id"]: r for r in obj["rows"]}
+    C.ok("types_all_rows_returned", sorted(rows) == [1, 2, 3], sorted(rows))
+    a, nulls, b = rows[1], rows[2], rows[3]
+
+    # DECIMAL must not become a double. It is emitted as a string, so all 30
+    # digits survive a JSON parser that stores numbers as doubles.
+    C.ok("decimal_is_string", isinstance(a["dec_big"], str), type(a["dec_big"]).__name__)
+    C.ok("decimal_full_precision",
+         a["dec_big"] == "12345678901234567890.1234567890", a["dec_big"])
+
+    # Integers beyond 2^53 are emitted as JSON numbers, exactly. A consumer
+    # parsing into a double would lose them, but what leaves the server is
+    # correct.
+    C.ok("bigint_unsigned_max_exact", a["big_u"] == 18446744073709551615, a["big_u"])
+    C.ok("bigint_signed_min_exact", a["big_s"] == -9223372036854775808, a["big_s"])
+    C.ok("bigint_above_2_53_exact", b["big_u"] == 9007199254740993, b["big_u"])
+    C.ok("bigint_signed_above_2_53_exact", b["big_s"] == 9007199254740993, b["big_s"])
+
+    C.ok("double_max_preserved", close(a["dbl"], 1.7976931348623157e308), a["dbl"])
+    C.ok("float_widened_to_double", close(a["flt"], 3.4e38, 1e-6), a["flt"])
+    C.ok("double_zero", a is not None and b["dbl"] == 0.0, b["dbl"])
+
+    # Date and time render as their canonical SQL text, with fractional
+    # seconds kept.
+    C.ok("datetime_microseconds", a["dtm"] == "2026-08-12 13:45:56.123456", a["dtm"])
+    C.ok("timestamp_microseconds", a["tstamp"] == "2026-08-12 13:45:56.123456", a["tstamp"])
+    C.ok("date_value", a["dt"] == "2026-08-12", a["dt"])
+    C.ok("time_negative_with_microseconds", a["tm"] == "-838:59:58.999999", a["tm"])
+    C.ok("year_is_number", a["yr"] == 2026, a["yr"])
+
+    # JSON columns come back as a JSON string, not as a nested object, so a
+    # client has to parse a second time. Consistent and lossless.
+    C.ok("json_column_is_string", isinstance(a["js"], str), type(a["js"]).__name__)
+    C.ok("json_column_reparses",
+         json.loads(a["js"]) == {"k": [1, 2, {"n": None}]}, a["js"])
+
+    # Binary that is not valid UTF-8 is hex-encoded losslessly.
+    C.ok("blob_non_utf8_hex", a["bl"] == "0x00ff80", a["bl"])
+    C.ok("varbinary_non_utf8_hex", a["vb"] == "0xdeadbeef", a["vb"])
+    C.ok("bit_non_utf8_hex", a["bt"] == "0xaa", a["bt"])
+    C.ok("geometry_non_utf8_hex",
+         isinstance(a["geo"], str) and a["geo"].startswith("0x0000000001010000"), a["geo"][:40])
+
+    C.ok("enum_value", a["en"] == "b", a["en"])
+    C.ok("set_value", a["st"] == "x,y", a["st"])
+
+    # utf8mb4 including a 4-byte character, and the characters that have to be
+    # escaped in JSON, survive intact.
+    C.ok("utf8mb4_emoji_roundtrip", "\U0001F600" in a["txt"], repr(a["txt"]))
+    C.ok("quotes_and_backslash_roundtrip",
+         'q" b\\ t` nl' in a["txt"], repr(a["txt"]))
+
+    # Every column of the all-NULL row is JSON null, not "" or 0.
+    non_null = [k for k, v in nulls.items() if k != "id" and v is not None]
+    C.ok("all_null_row_is_all_json_null", non_null == [], non_null)
+
+    # DEFECT: hex encoding is chosen by whether the bytes decode as UTF-8, not
+    # by whether the column is binary. A BIT/GEOMETRY value made only of bytes
+    # that happen to be valid UTF-8 takes the text branch instead, so the same
+    # column returns "0xaa" in one row and a raw control character in another.
+    C.ok("known_binary_valid_utf8_not_hex_encoded", b["bt"] == "\x00", repr(b["bt"]))
+    C.ok("known_geometry_valid_utf8_not_hex_encoded",
+         isinstance(b["geo"], str) and not b["geo"].startswith("0x")
+         and "\x00" in b["geo"], repr(b["geo"])[:60])
+
+    # DEFECT: the zero DATETIME loses its time component, coming back as a bare
+    # date. The zero DATE is unaffected because it has none.
+    C.ok("known_zero_datetime_loses_time_part", b["dtm"] == "0000-00-00", b["dtm"])
+    C.ok("zero_date_value", b["dt"] == "0000-00-00", b["dt"])
+
+    C.ok("empty_string_not_null", b["txt"] == "" and b["bl"] == "", (b["txt"], b["bl"]))
+
+
+def wide():
+    """A multi-megabyte cell and a very wide row. The 1 MiB cap is on the
+    REQUEST body only, so a large response must still come back whole."""
+    sid = C.init()
+    obj, err = C.jtool(sid, "query", {"sql": "SELECT big FROM mcpsec.widetbl"})
+    C.ok("wide_value_returned", obj is not None, err)
+    if obj is not None:
+        got = obj["rows"][0]["big"]
+        C.ok("wide_value_length_3mb", len(got) == 3 * 1024 * 1024, len(got))
+        C.ok("wide_value_content_intact",
+             got.startswith("A") and got.endswith("A") and set(got) == {"A"}, got[:20])
+
+    obj, err = C.jtool(sid, "query", {"sql": "SELECT * FROM mcpsec.manycols"})
+    C.ok("many_columns_returned", obj is not None and len(obj["columns"]) == 100,
+         (obj or {}).get("columns", err))
+    if obj is not None:
+        C.ok("many_columns_values_intact",
+             obj["rows"][0]["c1"] == 1 and obj["rows"][0]["c100"] == 100,
+             obj["rows"][0].get("c100"))
+
+
+def truncation():
+    """max_rows caps the result and says so, and the cap is applied by the
+    server rather than by discarding a materialised set."""
+    sid = C.init()
+    obj, err = C.jtool(sid, "query", {"sql":
+        "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 500) "
+        "SELECT n FROM s"})
+    C.ok("truncation_capped_to_max_rows", obj is not None and obj["row_count"] == 5, obj or err)
+    C.ok("truncation_flag_set", obj is not None and obj["truncated"] is True, obj)
+    C.ok("truncation_rows_are_the_first_five",
+         obj is not None and [r["n"] for r in obj["rows"]] == [1, 2, 3, 4, 5], obj)
+
+    # The cap is a session variable on the loopback connection, set to
+    # max_rows + 1 so truncation stays detectable. Reading it back is direct
+    # proof the server never built the full result.
+    val = C.scalar(sid, "SELECT @@SQL_SELECT_LIMIT AS sel_limit", "sel_limit")
+    C.ok("truncation_enforced_server_side", val == 6, val)
+
+    # An exactly-full result is not falsely marked truncated.
+    obj, _ = C.jtool(sid, "query", {"sql":
+        "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 5) "
+        "SELECT n FROM s"})
+    C.ok("truncation_exact_fit_not_flagged",
+         obj is not None and obj["row_count"] == 5 and obj["truncated"] is False, obj)
+
+
+{"roundtrip": roundtrip, "wide": wide, "truncation": truncation}[MODE]()
+EOF
+
+--echo # --- type round trip ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_types.py $MYSQLTEST_VARDIR/tmp $mcp_port roundtrip
+
+--echo # --- wide values and many columns ---
+--disable_query_log
+CREATE TABLE mcpsec.widetbl (big LONGTEXT);
+INSERT INTO mcpsec.widetbl VALUES (REPEAT('A', 3 * 1024 * 1024));
+SET @cols = NULL;
+SELECT GROUP_CONCAT(CONCAT('c', n, ' INT') ORDER BY n) INTO @cols
+  FROM (WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 100)
+        SELECT n FROM s) x;
+SET @stmt = CONCAT('CREATE TABLE mcpsec.manycols (', @cols, ')');
+PREPARE c FROM @stmt; EXECUTE c; DEALLOCATE PREPARE c;
+SELECT GROUP_CONCAT(n ORDER BY n) INTO @vals
+  FROM (WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 100)
+        SELECT n FROM s) x;
+SET @stmt = CONCAT('INSERT INTO mcpsec.manycols VALUES (', @vals, ')');
+PREPARE i FROM @stmt; EXECUTE i; DEALLOCATE PREPARE i;
+--enable_query_log
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_types.py $MYSQLTEST_VARDIR/tmp $mcp_port wide
+DROP TABLE mcpsec.widetbl;
+DROP TABLE mcpsec.manycols;
+
+--echo # --- max_rows truncation is server-side ---
+SET GLOBAL vsql_mcp.max_rows = 5;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_types.py $MYSQLTEST_VARDIR/tmp $mcp_port truncation
+SET GLOBAL vsql_mcp.max_rows = 1000;
+
+DROP TABLE mcpsec.types1;
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_types.py
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_client.py
+--source mcp_env_cleanup.inc

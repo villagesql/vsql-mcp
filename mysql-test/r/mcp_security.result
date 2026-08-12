@@ -1,0 +1,187 @@
+INSTALL EXTENSION vsql_mcp;
+CREATE USER mcpuser@'127.0.0.1';
+GRANT SELECT, SHOW VIEW ON *.* TO mcpuser@'127.0.0.1';
+CREATE SCHEMA mcpsec;
+GRANT INSERT, UPDATE, DELETE ON mcpsec.* TO mcpuser@'127.0.0.1';
+CREATE TABLE mcpsec.t1 (id INT PRIMARY KEY, name VARCHAR(50));
+INSERT INTO mcpsec.t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+CREATE TABLE mcpsec.secret (id INT PRIMARY KEY, password_hash VARCHAR(80), KEY ix_ph (password_hash));
+INSERT INTO mcpsec.secret VALUES (1, 'hunter2hash');
+CREATE SCHEMA mcpalt;
+CREATE TABLE mcpalt.t1 (id INT PRIMARY KEY, tag VARCHAR(30));
+INSERT INTO mcpalt.t1 VALUES (1, 'other-schema-row');
+CREATE VIEW mcpsec.v_leak AS SELECT id, tag FROM mcpalt.t1;
+CREATE VIEW mcpsec.v_secret AS SELECT password_hash FROM mcpsec.secret;
+SET GLOBAL vsql_mcp.port = 0;
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+# --- statement classification: evasion attempts ---
+classify_block_comment: PASS
+classify_dash_comment: PASS
+classify_hash_comment: PASS
+classify_nested_comments: PASS
+classify_create: PASS
+classify_drop: PASS
+classify_alter: PASS
+classify_truncate: PASS
+classify_handler: PASS
+classify_do: PASS
+classify_set: PASS
+classify_call: PASS
+classify_load_data_local: PASS
+classify_update: PASS
+classify_delete: PASS
+classify_replace: PASS
+classify_insert: PASS
+classify_multi_statement: PASS
+classify_trailing_semicolon_allowed: PASS
+classify_semicolon_in_string_allowed: PASS
+known_backslash_escape_over_rejected: PASS
+known_semicolon_in_trailing_comment_rejected: PASS
+known_parenthesised_select_rejected: PASS
+known_parenthesised_union_rejected: PASS
+known_version_comment_reaches_server: PASS
+classify_leading_whitespace_ok: PASS
+# side effects after every classification attempt: none
+SELECT COUNT(*) AS t1_rows FROM mcpsec.t1;
+t1_rows
+3
+SELECT COUNT(*) AS evil_tables FROM information_schema.TABLES
+WHERE TABLE_SCHEMA='mcpsec' AND TABLE_NAME='evil';
+evil_tables
+0
+# --- layered read-only enforcement ---
+session_is_read_only: PASS
+session_has_statement_timeout: PASS
+session_row_cap_is_server_side: PASS
+for_update_caught_by_session_layer: PASS
+cte_delete_caught_by_session_layer: PASS
+known_into_outfile_stopped_only_by_grants: PASS
+known_into_dumpfile_stopped_only_by_grants: PASS
+# --- schema scoping ---
+SET GLOBAL vsql_mcp.schema = 'mcpsec';
+schema_reject_plain: PASS
+schema_reject_backtick: PASS
+schema_reject_mixed_case: PASS
+schema_reject_subquery: PASS
+schema_reject_information_schema: PASS
+schema_reject_mysql: PASS
+schema_reject_performance_schema: PASS
+schema_reject_sys: PASS
+schema_allows_configured_schema: PASS
+schema_ignores_string_literal: PASS
+known_schema_bypass_whitespace_dot_space: PASS
+known_schema_bypass_whitespace_dot_tab: PASS
+known_schema_bypass_whitespace_dot_newline: PASS
+known_schema_bypass_whitespace_dot_backtick_space: PASS
+known_schema_bypass_via_view: PASS
+known_alias_qualified_column_rejected: PASS
+known_table_qualified_column_rejected: PASS
+known_unqualified_name_has_no_default_db: PASS
+SET GLOBAL vsql_mcp.schema = '';
+# --- table allowlist ---
+SET GLOBAL vsql_mcp.allowed_tables = 't1';
+allowlist_permits_listed_table: PASS
+allowlist_reject_direct: PASS
+allowlist_reject_subquery: PASS
+allowlist_reject_join: PASS
+allowlist_reject_derived_aliased_as_allowed: PASS
+allowlist_reject_view_over_non_allowed: PASS
+allowlist_sees_through_view: PASS
+known_allowlist_bypass_min_exfiltrates_value: PASS
+known_allowlist_bypass_max_exfiltrates_value: PASS
+known_allowlist_bypass_min_on_pk: PASS
+known_allowlist_bypass_impossible_where: PASS
+known_allowlist_bypass_limit_zero: PASS
+known_allowlist_matches_bare_name_across_schemas: PASS
+known_allowlist_rejects_union_of_allowed_tables: PASS
+known_allowlist_breaks_show_tables: PASS
+known_allowlist_breaks_describe: PASS
+known_allowlist_breaks_show_create: PASS
+known_allowlist_not_applied_to_resources: PASS
+known_allowlist_not_applied_to_describe_table: PASS
+known_allowlist_not_applied_to_list_tables: PASS
+SET GLOBAL vsql_mcp.allowed_tables = '';
+# --- bearer auth ---
+SET GLOBAL vsql_mcp.require_auth = ON;
+SET GLOBAL vsql_mcp.bearer_token = 'tok3n-Value';
+auth_missing_header_401: PASS
+auth_wrong_token_401: PASS
+auth_empty_token_401: PASS
+auth_correct_token_200: PASS
+known_auth_scheme_case_sensitive: PASS
+known_auth_rejects_extra_space: PASS
+auth_enforced_on_delete: PASS
+known_get_405_before_auth: PASS
+SET GLOBAL vsql_mcp.require_auth = OFF;
+SET GLOBAL vsql_mcp.bearer_token = '';
+# --- Origin validation (DNS rebinding defence) ---
+origin_rejects_https_evil_example: PASS
+origin_rejects_http_localhost_evil_com: PASS
+origin_rejects_http_127_0_0_1_evil_com: PASS
+origin_rejects_null: PASS
+origin_rejects_http_127_0_0_1_at_evil_com: PASS
+origin_allows_http_localhost: PASS
+origin_allows_http_LOCALHOST: PASS
+origin_allows_http_127_0_0_1_9999: PASS
+origin_allows_https_127_0_0_1: PASS
+origin_allows_http___1_9999: PASS
+origin_absent_allowed: PASS
+# --- session handling ---
+session_ids_distinct: PASS
+session_id_is_128_bit_hex: PASS
+session_forged_id_404: PASS
+session_missing_header_400: PASS
+session_delete_200: PASS
+session_reuse_after_delete_404: PASS
+session_sibling_still_live: PASS
+# --- write tool disabled ---
+known_write_tool_listed_while_disabled: PASS
+write_disabled_refuses: PASS
+write_disabled_refuses: PASS
+write_disabled_refuses: PASS
+# nothing was written while the tool was disabled
+SELECT COUNT(*) AS t1_rows FROM mcpsec.t1;
+t1_rows
+3
+# --- write tool enabled ---
+SET GLOBAL vsql_mcp.allow_write = ON;
+write_insert_reports_affected_rows: PASS
+write_refuses_ddl: PASS
+write_refuses_select: PASS
+write_refuses_multi: PASS
+known_write_accepts_replace: PASS
+known_write_allows_unbounded_delete: PASS
+# an unqualified DELETE through the write tool emptied the table
+SELECT COUNT(*) AS t1_rows_after_unbounded_delete FROM mcpsec.t1;
+t1_rows_after_unbounded_delete
+0
+SET GLOBAL vsql_mcp.allow_write = OFF;
+INSERT INTO mcpsec.t1 VALUES (1,'alpha'), (2,'beta'), (3,'gamma');
+# --- credentials never appear in a response ---
+SET GLOBAL vsql_mcp.require_auth = ON;
+SET GLOBAL vsql_mcp.bearer_token = 'tok3n-Value';
+SET GLOBAL vsql_mcp.db_url = 'mysql://mcpuser:SUPERSECRETPW@127.0.0.1:59999';
+secrets_password_not_echoed: PASS
+secrets_bearer_token_not_echoed: PASS
+secrets_connect_error_is_useful: PASS
+SET GLOBAL vsql_mcp.require_auth = OFF;
+SET GLOBAL vsql_mcp.bearer_token = '';
+# the excluded value never left the database
+SELECT COUNT(*) AS secret_rows FROM mcpsec.secret;
+secret_rows
+1
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+SET GLOBAL vsql_mcp.schema = '';
+SET GLOBAL vsql_mcp.allowed_tables = '';
+SET GLOBAL vsql_mcp.allow_write = OFF;
+SET GLOBAL vsql_mcp.require_auth = OFF;
+SET GLOBAL vsql_mcp.bearer_token = '';
+SET GLOBAL vsql_mcp.max_rows = 1000;
+SET GLOBAL vsql_mcp.query_timeout = 30;
+SET GLOBAL vsql_mcp.db_url = '';
+DROP VIEW mcpsec.v_secret;
+DROP VIEW mcpsec.v_leak;
+DROP SCHEMA mcpalt;
+DROP SCHEMA mcpsec;
+DROP USER mcpuser@'127.0.0.1';
+UNINSTALL EXTENSION vsql_mcp;

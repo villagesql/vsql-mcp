@@ -1,0 +1,108 @@
+INSTALL EXTENSION vsql_mcp;
+CREATE USER mcpuser@'127.0.0.1';
+GRANT SELECT, SHOW VIEW ON *.* TO mcpuser@'127.0.0.1';
+CREATE SCHEMA mcpsec;
+GRANT INSERT, UPDATE, DELETE ON mcpsec.* TO mcpuser@'127.0.0.1';
+CREATE TABLE mcpsec.t1 (id INT PRIMARY KEY, name VARCHAR(50));
+INSERT INTO mcpsec.t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+CREATE TABLE mcpsec.secret (id INT PRIMARY KEY, password_hash VARCHAR(80), KEY ix_ph (password_hash));
+INSERT INTO mcpsec.secret VALUES (1, 'hunter2hash');
+CREATE SCHEMA mcpalt;
+CREATE TABLE mcpalt.t1 (id INT PRIMARY KEY, tag VARCHAR(30));
+INSERT INTO mcpalt.t1 VALUES (1, 'other-schema-row');
+CREATE VIEW mcpsec.v_leak AS SELECT id, tag FROM mcpalt.t1;
+CREATE VIEW mcpsec.v_secret AS SELECT password_hash FROM mcpsec.secret;
+SET GLOBAL vsql_mcp.port = 0;
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+# A row of every type that has an awkward JSON mapping, a row of all
+# NULLs, and a row of boundary values.
+SET SESSION sql_mode = '';
+CREATE TABLE mcpsec.types1 (
+id INT PRIMARY KEY,
+dec_big DECIMAL(30,10), big_u BIGINT UNSIGNED, big_s BIGINT,
+dbl DOUBLE, flt FLOAT,
+dtm DATETIME(6), tstamp TIMESTAMP(6) NULL, dt DATE, tm TIME(6), yr YEAR,
+js JSON, bl BLOB, vb VARBINARY(32), bt BIT(8),
+en ENUM('a','b'), st SET('x','y'), geo GEOMETRY,
+txt VARCHAR(200) CHARACTER SET utf8mb4
+);
+INSERT INTO mcpsec.types1 VALUES (
+1, 12345678901234567890.1234567890, 18446744073709551615, -9223372036854775808,
+1.7976931348623157e308, 3.4e38,
+'2026-08-12 13:45:56.123456', '2026-08-12 13:45:56.123456', '2026-08-12',
+'-838:59:58.999999', 2026,
+'{"k":[1,2,{"n":null}]}', UNHEX('00FF80'), UNHEX('DEADBEEF'), b'10101010',
+'b', 'x,y', ST_GeomFromText('POINT(1 2)'),
+CONCAT('emoji ', CHAR(0xF09F9880 USING utf8mb4), ' q" b\\ t` nl')
+);
+INSERT INTO mcpsec.types1 (id) VALUES (2);
+INSERT INTO mcpsec.types1 VALUES (
+3, 0, 9007199254740993, 9007199254740993, 0, 0,
+'0000-00-00 00:00:00.000000', NULL, '0000-00-00', '00:00:00', 0,
+'null', '', '', b'0', 'a', '', ST_GeomFromText('POINT(0 0)'), ''
+);
+# --- type round trip ---
+types_query_succeeded: PASS
+types_all_rows_returned: PASS
+decimal_is_string: PASS
+decimal_full_precision: PASS
+bigint_unsigned_max_exact: PASS
+bigint_signed_min_exact: PASS
+bigint_above_2_53_exact: PASS
+bigint_signed_above_2_53_exact: PASS
+double_max_preserved: PASS
+float_widened_to_double: PASS
+double_zero: PASS
+datetime_microseconds: PASS
+timestamp_microseconds: PASS
+date_value: PASS
+time_negative_with_microseconds: PASS
+year_is_number: PASS
+json_column_is_string: PASS
+json_column_reparses: PASS
+blob_non_utf8_hex: PASS
+varbinary_non_utf8_hex: PASS
+bit_non_utf8_hex: PASS
+geometry_non_utf8_hex: PASS
+enum_value: PASS
+set_value: PASS
+utf8mb4_emoji_roundtrip: PASS
+quotes_and_backslash_roundtrip: PASS
+all_null_row_is_all_json_null: PASS
+known_binary_valid_utf8_not_hex_encoded: PASS
+known_geometry_valid_utf8_not_hex_encoded: PASS
+known_zero_datetime_loses_time_part: PASS
+zero_date_value: PASS
+empty_string_not_null: PASS
+# --- wide values and many columns ---
+wide_value_returned: PASS
+wide_value_length_3mb: PASS
+wide_value_content_intact: PASS
+many_columns_returned: PASS
+many_columns_values_intact: PASS
+DROP TABLE mcpsec.widetbl;
+DROP TABLE mcpsec.manycols;
+# --- max_rows truncation is server-side ---
+SET GLOBAL vsql_mcp.max_rows = 5;
+truncation_capped_to_max_rows: PASS
+truncation_flag_set: PASS
+truncation_rows_are_the_first_five: PASS
+truncation_enforced_server_side: PASS
+truncation_exact_fit_not_flagged: PASS
+SET GLOBAL vsql_mcp.max_rows = 1000;
+DROP TABLE mcpsec.types1;
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+SET GLOBAL vsql_mcp.schema = '';
+SET GLOBAL vsql_mcp.allowed_tables = '';
+SET GLOBAL vsql_mcp.allow_write = OFF;
+SET GLOBAL vsql_mcp.require_auth = OFF;
+SET GLOBAL vsql_mcp.bearer_token = '';
+SET GLOBAL vsql_mcp.max_rows = 1000;
+SET GLOBAL vsql_mcp.query_timeout = 30;
+SET GLOBAL vsql_mcp.db_url = '';
+DROP VIEW mcpsec.v_secret;
+DROP VIEW mcpsec.v_leak;
+DROP SCHEMA mcpalt;
+DROP SCHEMA mcpsec;
+DROP USER mcpuser@'127.0.0.1';
+UNINSTALL EXTENSION vsql_mcp;

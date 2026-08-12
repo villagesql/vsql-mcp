@@ -1,0 +1,358 @@
+# vsql_mcp — concurrency, connection health, and listener lifecycle.
+#
+# The worker drains requests serially and opens one loopback connection per
+# tool call, so the properties that matter are: every concurrent request still
+# gets its own correct answer, connections do not accumulate, and the listener
+# can be cycled without leaking a socket or — the invariant AGENTS.md calls the
+# most important in the codebase — deadlocking the server.
+#
+# The in-flight disable test uses a detached helper: a foreground launcher
+# starts a child, blocks until the child has actually put a slow request on the
+# wire, and only then exits, so MTR toggles the listener with a call genuinely
+# in progress. The child carries its own watchdog so it cannot outlive the test,
+# and its output goes to a log under the test tmp dir rather than to /dev/null.
+
+--source mcp_env.inc
+--source mcp_client.inc
+
+--write_file $MYSQLTEST_VARDIR/tmp/mcp_conc.py
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, sys.argv[1])
+import mcp_client as C
+
+C.configure(sys.argv[2])
+MODE = sys.argv[3]
+TMP = sys.argv[1]
+
+READY = os.path.join(TMP, "mcp_inflight.ready")
+RESULT = os.path.join(TMP, "mcp_inflight.out")
+CHILDLOG = os.path.join(TMP, "mcp_inflight.log")
+
+
+def fanout():
+    """50 concurrent tool calls, each asking for a value only it should see."""
+    sid = C.init()
+
+    def one(i):
+        return C.scalar(sid, "SELECT %d AS n" % i, "n", timeout=180)
+
+    results, elapsed = C.burst(one, 50)
+    C.ok("fanout_all_answered", all(r is not None for r in results),
+         [i for i, r in enumerate(results) if r is None][:5])
+    # The decisive check: no answer landed in another request's response.
+    mismatched = [(i, r) for i, r in enumerate(results) if r != i]
+    C.ok("fanout_no_crossed_responses", mismatched == [], mismatched[:5])
+    C.ok("fanout_completed_without_stalling", elapsed < 120, "%.1fs" % elapsed)
+
+    # Distinct sessions in parallel, so the session map is exercised too.
+    sids, _ = C.burst(lambda i: C.init(), 20)
+    C.ok("fanout_sessions_all_issued", all(s for s in sids), sids[:3])
+    C.ok("fanout_sessions_all_distinct", len(set(sids)) == 20, len(set(sids)))
+
+
+def mixed_load():
+    """Half the burst is slow enough to hit query_timeout. The fast half must
+    still be answered correctly and the server must not be left stalled."""
+    sid = C.init()
+
+    def one(i):
+        if i % 2 == 0:
+            return C.scalar(sid, "SELECT %d AS n" % i, "n", timeout=180)
+        _, err = C.tool(sid, "query", {"sql": "SELECT SLEEP(10) AS s"}, timeout=180)
+        return "slow-err" if err else "slow-ok"
+
+    results, elapsed = C.burst(one, 20)
+    fast = [(i, r) for i, r in enumerate(results) if i % 2 == 0]
+    C.ok("mixed_fast_calls_all_correct", all(r == i for i, r in fast),
+         [(i, r) for i, r in fast if r != i][:5])
+    slow = [r for i, r in enumerate(results) if i % 2 == 1]
+    C.ok("mixed_slow_calls_all_returned", all(r is not None for r in slow), slow[:3])
+    C.ok("mixed_load_completed", elapsed < 180, "%.1fs" % elapsed)
+
+    # No permanent stall: a plain call right afterwards still works.
+    C.ok("mixed_server_healthy_after", C.scalar(sid, "SELECT 7 AS n", "n") == 7)
+
+
+def inflight_launch():
+    """Foreground launcher. Exits only once the child has a slow request on the
+    wire, so MTR can safely disable the listener underneath it."""
+    for path in (READY, RESULT, CHILDLOG):
+        if os.path.exists(path):
+            os.remove(path)
+    sid = C.init()
+    log = open(CHILDLOG, "wb")
+    subprocess.Popen([sys.executable, "-B", os.path.abspath(__file__),
+                      TMP, str(C.PORT), "inflight_child", sid],
+                     stdout=log, stderr=log, start_new_session=True)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if os.path.exists(READY):
+            C.ok("inflight_request_is_on_the_wire", True)
+            return
+        time.sleep(0.05)
+    # Never hide a helper failure: surface its log on stderr.
+    log.flush()
+    sys.stderr.write("child log:\n" + open(CHILDLOG).read() + "\n")
+    C.ok("inflight_request_is_on_the_wire", False, "child never signalled ready")
+
+
+def inflight_child():
+    """Detached child. Sends a slow tool call over a raw socket so readiness can
+    be signalled at the exact moment the bytes are sent, then records what came
+    back. Self-destructs well inside the test's lifetime."""
+    import socket
+    sid = sys.argv[4]
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "query",
+                                  "arguments": {"sql": "SELECT SLEEP(8) AS s"}}})
+    req = ("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+           "Content-Type: application/json\r\nAccept: application/json\r\n"
+           "MCP-Protocol-Version: 2025-06-18\r\nMcp-Session-Id: %s\r\n"
+           "Content-Length: %d\r\nConnection: close\r\n\r\n%s" % (sid, len(body), body))
+    outcome = "no-response"
+    try:
+        s = socket.create_connection(("127.0.0.1", int(C.PORT)), timeout=10)
+        s.sendall(req.encode())
+        with open(READY, "w") as f:
+            f.write("sent\n")
+        s.settimeout(45)                      # watchdog: bounded, then give up
+        chunks = []
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            chunks.append(b)
+        outcome = "response" if chunks else "closed-without-response"
+    except Exception as e:                    # noqa: BLE001 - recorded, not raised
+        outcome = "exception: %s" % type(e).__name__
+    finally:
+        with open(READY, "a") as f:
+            f.write("done\n")
+        with open(RESULT, "w") as f:
+            f.write(outcome + "\n")
+
+
+def inflight_wait():
+    """Block until the detached child has recorded an outcome, so nothing is
+    left running when the test ends."""
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        if os.path.exists(RESULT):
+            C.ok("inflight_child_finished", True)
+            return
+        time.sleep(0.1)
+    sys.stderr.write("child log:\n" + open(CHILDLOG).read() + "\n")
+    C.ok("inflight_child_finished", False, "child did not finish")
+
+
+def after_toggle():
+    """The server is healthy after the listener was cycled under load."""
+    sid = C.init()
+    C.ok("after_toggle_new_session_issued", bool(sid))
+    C.ok("after_toggle_query_works", C.scalar(sid, "SELECT 11 AS n", "n") == 11)
+
+
+def stale_session():
+    """A session minted before a disable must not survive it."""
+    sid = open(os.path.join(TMP, "mcp_old_session.txt")).read().strip()
+    st, _, _ = C.rpc(sid, "ping")
+    C.ok("session_from_before_disable_is_gone", st == 404, st)
+
+
+def mint_session():
+    sid = C.init()
+    with open(os.path.join(TMP, "mcp_old_session.txt"), "w") as f:
+        f.write(sid)
+    C.ok("session_minted_before_disable", bool(sid))
+
+
+def live_config():
+    """Which settings take effect on the next request, and which need a
+    rebind. Called repeatedly by MTR with the expectation as an argument."""
+    what = sys.argv[4]
+    sid = C.init()
+    if what == "schema_on":
+        _, err = C.tool(sid, "query", {"sql": "SELECT tag FROM mcpalt.t1"})
+        C.ok("live_schema_applies_without_restart", "outside the exposed schema" in err, err[:100])
+    elif what == "schema_off":
+        rows = C.query_rows(sid, "SELECT tag FROM mcpalt.t1")
+        C.ok("live_schema_cleared_without_restart", rows == [{"tag": "other-schema-row"}], rows)
+    elif what == "allow_on":
+        _, err = C.tool(sid, "query", {"sql": "SELECT password_hash FROM mcpsec.secret"})
+        C.ok("live_allowed_tables_applies_without_restart",
+             "not in vsql_mcp.allowed_tables" in err, err[:100])
+    elif what == "maxrows":
+        obj, _ = C.jtool(sid, "query", {"sql": "SELECT id FROM mcpsec.t1 ORDER BY id"})
+        C.ok("live_max_rows_applies_without_restart",
+             obj is not None and obj["row_count"] == 2 and obj["truncated"] is True, obj)
+    elif what == "write_on":
+        obj, err = C.jtool(sid, "write", {"sql": "INSERT INTO mcpsec.t1 VALUES (50,'live')"})
+        C.ok("live_allow_write_applies_without_restart",
+             obj == {"affected_rows": 1}, obj or err)
+
+
+def counters():
+    """A scripted sequence with known deltas. MTR reads the counters either
+    side and prints the differences."""
+    sid = C.init()
+    # 3 successful queries returning 3 + 1 + 2 = 6 rows.
+    C.ok("counters_q1", len(C.query_rows(sid, "SELECT id FROM mcpsec.t1 ORDER BY id") or []) == 3)
+    C.ok("counters_q2", len(C.query_rows(sid, "SELECT id FROM mcpsec.t1 WHERE id=1") or []) == 1)
+    C.ok("counters_q3", len(C.query_rows(sid, "SELECT id FROM mcpsec.t1 WHERE id<3") or []) == 2)
+    # 2 failing tool calls: one unknown tool, one guardrail rejection.
+    _, e1 = C.tool(sid, "nosuchtool", {})
+    _, e2 = C.tool(sid, "query", {"sql": "DROP TABLE mcpsec.t1"})
+    C.ok("counters_two_errors", e1 != "" and e2 != "")
+    # A non-query tool succeeds: counts as a call, contributes no rows.
+    obj, _ = C.jtool(sid, "list_tables", {"schema": "mcpsec"})
+    C.ok("counters_list_tables_ok", obj is not None)
+
+
+{"fanout": fanout, "mixed": mixed_load, "inflight_launch": inflight_launch,
+ "inflight_child": inflight_child, "inflight_wait": inflight_wait,
+ "after_toggle": after_toggle, "stale_session": stale_session,
+ "mint_session": mint_session, "live_config": live_config,
+ "counters": counters}[MODE]()
+EOF
+
+--echo # --- loopback connections held by the extension before any load ---
+SELECT COUNT(*) AS mcpuser_connections FROM information_schema.processlist
+ WHERE USER = 'mcpuser';
+
+--echo # --- 50 concurrent tool calls ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port fanout
+
+--echo # --- connections after the burst: the extension opens one per call and closes it ---
+let $wait_condition=
+  SELECT COUNT(*) = 0 FROM information_schema.processlist WHERE USER = 'mcpuser';
+--source include/wait_condition.inc
+SELECT COUNT(*) AS mcpuser_connections FROM information_schema.processlist
+ WHERE USER = 'mcpuser';
+
+--echo # --- mixed fast and timing-out load ---
+SET GLOBAL vsql_mcp.query_timeout = 2;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port mixed
+SET GLOBAL vsql_mcp.query_timeout = 30;
+
+--echo # --- connections after the timing-out burst ---
+let $wait_condition=
+  SELECT COUNT(*) = 0 FROM information_schema.processlist WHERE USER = 'mcpuser';
+--source include/wait_condition.inc
+SELECT COUNT(*) AS mcpuser_connections FROM information_schema.processlist
+ WHERE USER = 'mcpuser';
+
+--echo # --- disable the listener with a tool call in flight ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port inflight_launch
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+let $wait_condition=
+  SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+--echo # the disable completed while a call was outstanding
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+let $wait_condition=
+  SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+let $mcp_port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port'`;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port inflight_wait
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port after_toggle
+
+--echo # --- sessions do not survive a disable ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port mint_session
+SELECT VARIABLE_VALUE AS sessions_active_before_disable
+  FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.sessions_active';
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+let $wait_condition=
+  SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+SELECT VARIABLE_VALUE AS sessions_active_after_disable
+  FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.sessions_active';
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+let $wait_condition=
+  SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+--source include/wait_condition.inc
+let $mcp_port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port'`;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port stale_session
+
+--echo # --- 12 enable/disable cycles: rebinds every time, never deadlocks ---
+--disable_query_log
+let $cycles= 12;
+while ($cycles)
+{
+  SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+  let $wait_condition=
+    SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status
+     WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+  --source include/wait_condition.inc
+  SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+  let $wait_condition=
+    SELECT VARIABLE_VALUE > 0 FROM performance_schema.global_status
+     WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+  --source include/wait_condition.inc
+  dec $cycles;
+}
+--enable_query_log
+--echo # the server answered SQL throughout and the listener is bound again
+SELECT 1 AS server_responsive;
+SELECT VARIABLE_VALUE > 0 AS listener_rebound
+  FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port';
+SELECT VARIABLE_VALUE AS sessions_active_after_cycles
+  FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.sessions_active';
+let $mcp_port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port'`;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port after_toggle
+
+--echo # --- which settings apply without a rebind ---
+SET GLOBAL vsql_mcp.schema = 'mcpsec';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port live_config schema_on
+SET GLOBAL vsql_mcp.schema = '';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port live_config schema_off
+SET GLOBAL vsql_mcp.allowed_tables = 't1';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port live_config allow_on
+SET GLOBAL vsql_mcp.allowed_tables = '';
+SET GLOBAL vsql_mcp.max_rows = 2;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port live_config maxrows
+SET GLOBAL vsql_mcp.max_rows = 1000;
+SET GLOBAL vsql_mcp.allow_write = ON;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port live_config write_on
+SET GLOBAL vsql_mcp.allow_write = OFF;
+DELETE FROM mcpsec.t1 WHERE id = 50;
+
+--echo # port is a bind-time setting: changing it does not move the live listener
+--let $port_before= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port'`
+SET GLOBAL vsql_mcp.port = 3199;
+--let $port_after= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.http_port'`
+--disable_query_log
+--eval SELECT $port_before = $port_after AS live_port_unchanged_by_setting
+--enable_query_log
+SET GLOBAL vsql_mcp.port = 0;
+
+--echo # --- status counters move by exactly the expected deltas ---
+--let $calls_before= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.tool_calls_total'`
+--let $errors_before= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.tool_errors_total'`
+--let $rows_before= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.rows_returned_total'`
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_conc.py $MYSQLTEST_VARDIR/tmp $mcp_port counters
+--let $calls_after= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.tool_calls_total'`
+--let $errors_after= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.tool_errors_total'`
+--let $rows_after= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'vsql_mcp.rows_returned_total'`
+--disable_query_log
+--echo # 6 tool calls: 3 queries (6 rows), 2 failures, 1 list_tables
+--eval SELECT $calls_after - $calls_before AS tool_calls_delta
+--eval SELECT $errors_after - $errors_before AS tool_errors_delta
+--eval SELECT $rows_after - $rows_before AS rows_returned_delta
+--enable_query_log
+
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_inflight.ready
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_inflight.out
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_inflight.log
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_old_session.txt
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_conc.py
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_client.py
+--source mcp_env_cleanup.inc

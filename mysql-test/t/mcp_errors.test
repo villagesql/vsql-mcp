@@ -1,0 +1,248 @@
+# vsql_mcp — error handling, timeouts, and the shape an agent actually reads.
+#
+# The contract this file holds the extension to: a failing statement comes back
+# as a tool result with isError set and the engine's own message, over HTTP 200,
+# with the server still serving afterwards. Never a 500, never a dropped
+# connection, never a crash.
+#
+# It also pins the two timeout behaviours. Both are worth a test rather than a
+# bug report on their own terms: one is a documented Known Limitation whose
+# real-world consequence is sharper than the README implies, and the other is a
+# message-quality defect that the existing suite cannot see because it only
+# asserts that some error came back.
+
+--source mcp_env.inc
+--source mcp_client.inc
+
+--write_file $MYSQLTEST_VARDIR/tmp/mcp_err.py
+import json
+import sys
+import time
+
+sys.path.insert(0, sys.argv[1])
+import mcp_client as C
+
+C.configure(sys.argv[2])
+MODE = sys.argv[3]
+
+TIMEOUT_MESSAGE = "statement exceeded vsql_mcp.query_timeout"
+
+
+def engine_errors():
+    """Every engine-level failure is a tool error carrying the engine message,
+    and the server keeps serving after each one."""
+    sid = C.init()
+
+    cases = [
+        ("syntax", "SELECT FROM WHERE", "1064"),
+        ("missing_table", "SELECT * FROM mcpsec.nosuch", "1146"),
+        ("missing_column", "SELECT nosuchcol FROM mcpsec.t1", "1054"),
+        ("ambiguous_column",
+         "SELECT id FROM mcpsec.t1 a JOIN mcpsec.t1 b ON a.id=b.id", "1052"),
+        ("wrong_arg_count", "SELECT CONCAT() AS c", "1582"),
+    ]
+    for name, sql, code in cases:
+        st, body, _ = C.rpc(sid, "tools/call",
+                            {"name": "query", "arguments": {"sql": sql}})
+        text = body["result"]["content"][0]["text"] if "result" in body else ""
+        C.ok("error_%s_http_200" % name, st == 200, st)
+        C.ok("error_%s_is_tool_error" % name,
+             "result" in body and body["result"].get("isError") is True, body)
+        C.ok("error_%s_carries_engine_code" % name, code in text, text[:120])
+        # The server is still answering after the failure.
+        rows = C.query_rows(sid, "SELECT 1 AS alive")
+        C.ok("error_%s_server_still_serving" % name, rows == [{"alive": 1}], rows)
+
+    # The driver's Debug formatting is passed through verbatim, so an agent
+    # reading the message sees a Rust wrapper around the sentence it wants.
+    _, err = C.tool(sid, "query", {"sql": "SELECT * FROM mcpsec.nosuch"})
+    C.ok("known_error_wrapped_in_driver_debug_format",
+         err.startswith("MySqlError {") and err.endswith("}"), err[:120])
+
+    # Division by zero is NULL under MySQL's default sql_mode rather than an
+    # error, so it is a successful result. Pinned so a later sql_mode change
+    # does not silently alter what agents receive.
+    obj, _ = C.jtool(sid, "query", {"sql": "SELECT 1/0 AS z"})
+    C.ok("known_division_by_zero_is_null_not_error",
+         obj is not None and obj["rows"] == [{"z": None}], obj)
+
+    # A guardrail rejection is also a tool error, not a transport failure.
+    st, body, _ = C.rpc(sid, "tools/call",
+                        {"name": "query", "arguments": {"sql": "DROP TABLE mcpsec.t1"}})
+    C.ok("guardrail_rejection_is_tool_error_over_200",
+         st == 200 and body["result"].get("isError") is True, (st, body))
+
+
+def read_timeout():
+    """query_timeout = 2 against a statement that sleeps for longer."""
+    sid = C.init()
+
+    started = time.time()
+    _, err = C.tool(sid, "query", {"sql": "SELECT SLEEP(30) AS s"}, timeout=120)
+    elapsed = time.time() - started
+
+    C.ok("read_timeout_returns_an_error", err != "", err[:120])
+    # Bounded well below the sleep, so the call really was cut short rather
+    # than waiting it out. Generous headroom keeps this stable on a loaded box.
+    C.ok("read_timeout_bounded", elapsed < 20, "%.1fs" % elapsed)
+
+    # executor::map_err translates two timeout signatures into one clear
+    # sentence, but the driver reports a client read timeout as CodecError
+    # rather than IoError, so that branch never matches and the agent gets the
+    # driver's internal wording instead.
+    C.ok("known_read_timeout_message_is_not_the_intended_one",
+         TIMEOUT_MESSAGE not in err, err[:140])
+    C.ok("known_read_timeout_surfaces_driver_internals",
+         "CodecError" in err or "IO error" in err, err[:140])
+
+    # The connection is per call, so a timeout cannot poison the next one.
+    rows = C.query_rows(sid, "SELECT 1 AS alive")
+    C.ok("read_timeout_next_call_succeeds", rows == [{"alive": 1}], rows)
+    obj, _ = C.jtool(sid, "query", {"sql": "SELECT id FROM mcpsec.t1 ORDER BY id"})
+    C.ok("read_timeout_next_query_correct",
+         obj is not None and obj["row_count"] == 3, obj)
+
+
+def cross_join_timeout():
+    """A genuinely expensive plan, rather than SLEEP, must also be cut off."""
+    sid = C.init()
+    started = time.time()
+    _, err = C.tool(sid, "query", {"sql":
+        "SELECT COUNT(*) AS c FROM information_schema.COLUMNS a, "
+        "information_schema.COLUMNS b, information_schema.COLUMNS c"}, timeout=120)
+    elapsed = time.time() - started
+    C.ok("cross_join_timeout_returns_an_error", err != "", err[:120])
+    C.ok("cross_join_timeout_bounded", elapsed < 30, "%.1fs" % elapsed)
+    rows = C.query_rows(sid, "SELECT 1 AS alive")
+    C.ok("cross_join_timeout_server_still_serving", rows == [{"alive": 1}], rows)
+
+
+def write_timeout():
+    """MAX_EXECUTION_TIME does not apply to INSERT/UPDATE/DELETE, so a slow
+    write is bounded only by the client read timeout. The tool call ends; the
+    statement does not."""
+    sid = C.init()
+    started = time.time()
+    _, err = C.tool(sid, "write",
+                    {"sql": "UPDATE mcpsec.t1 SET name='TIMEDOUT' WHERE SLEEP(4)=0"},
+                    timeout=120)
+    elapsed = time.time() - started
+
+    C.ok("write_timeout_returns_an_error", err != "", err[:120])
+    C.ok("write_timeout_bounded_by_client_read_timeout", elapsed < 20, "%.1fs" % elapsed)
+    C.ok("known_write_timeout_message_is_not_the_intended_one",
+         TIMEOUT_MESSAGE not in err, err[:140])
+    # The agent has been told the write failed. MTR checks the table next, and
+    # finds that it did not.
+    C.ok("known_write_timeout_reported_as_failure", err != "", err[:80])
+
+
+def empty_states():
+    """An empty answer must still be a described answer, never null or a bare
+    list with no context."""
+    sid = C.init()
+
+    obj, err = C.jtool(sid, "query", {"sql": "SELECT id FROM mcpsec.t1 WHERE id = 999"})
+    C.ok("empty_no_matching_rows_has_columns",
+         obj is not None and obj["columns"] == ["id"], obj or err)
+    C.ok("empty_no_matching_rows_counted",
+         obj is not None and obj["rows"] == [] and obj["row_count"] == 0
+         and obj["truncated"] is False, obj)
+
+    obj, err = C.jtool(sid, "query", {"sql": "SELECT id, note FROM mcpsec.empty_t"})
+    C.ok("empty_table_has_columns",
+         obj is not None and obj["columns"] == ["id", "note"], obj or err)
+
+    obj, err = C.jtool(sid, "list_tables", {"schema": "mcpempty"})
+    C.ok("empty_schema_lists_no_tables",
+         obj is not None and obj["tables"] == [] and obj["schema"] == "mcpempty", obj or err)
+
+    st, body, _ = C.rpc(sid, "resources/read", {"uri": "vsql://mcpempty"})
+    text = body["result"]["contents"][0]["text"]
+    C.ok("empty_schema_overview_says_none", "(none)" in text, text[:80])
+
+    # describe_table works on a view, and reports its columns.
+    obj, err = C.jtool(sid, "describe_table", {"schema": "mcpsec", "table": "v_leak"})
+    cols = [c["name"] for c in obj["columns"]] if obj else []
+    C.ok("describe_table_on_view", cols == ["id", "tag"], cols or err)
+
+    # An aggregate over no rows is a row containing NULL, not an empty result.
+    obj, _ = C.jtool(sid, "query", {"sql": "SELECT MAX(id) AS m FROM mcpsec.empty_t"})
+    C.ok("empty_aggregate_returns_null_row",
+         obj is not None and obj["rows"] == [{"m": None}], obj)
+
+
+def not_configured():
+    """db_url misconfiguration must fail fast with a message that says what to
+    fix, and must never hang."""
+    sid = C.init()
+    started = time.time()
+    _, err = C.tool(sid, "query", {"sql": "SELECT 1 AS a"}, timeout=60)
+    elapsed = time.time() - started
+    C.ok("db_url_failure_is_prompt", elapsed < 30, "%.1fs" % elapsed)
+    C.ok("db_url_failure_is_tool_error", err != "", err)
+    print("db_url_message: %s" % sys.argv[4])
+    expected = {"unset": "vsql_mcp.db_url is not set",
+                "malformed": "invalid db_url:",
+                "refused": "loopback connect failed:",
+                "denied": "loopback connect failed:"}[sys.argv[4]]
+    C.ok("db_url_%s_message" % sys.argv[4], expected in err, err[:160])
+    if sys.argv[4] == "denied":
+        C.ok("db_url_denied_names_access_denied", "1045" in err, err[:160])
+
+
+{"engine": engine_errors, "read_timeout": read_timeout, "cross_join": cross_join_timeout,
+ "write_timeout": write_timeout, "empty": empty_states, "not_configured": not_configured}[MODE]()
+EOF
+
+--echo # --- engine errors surface as tool errors ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port engine
+
+--echo # --- read timeout ---
+SET GLOBAL vsql_mcp.query_timeout = 2;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port read_timeout
+
+--echo # --- expensive plan, not just SLEEP ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port cross_join
+
+--echo # --- write timeout: the call is bounded, the statement is not ---
+SET GLOBAL vsql_mcp.allow_write = ON;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port write_timeout
+--echo # the tool reported failure; wait for the abandoned UPDATE to land anyway
+let $wait_condition=
+  SELECT COUNT(*) = 3 FROM mcpsec.t1 WHERE name = 'TIMEDOUT';
+--source include/wait_condition.inc
+SELECT COUNT(*) AS rows_written_after_reported_failure
+  FROM mcpsec.t1 WHERE name = 'TIMEDOUT';
+SET GLOBAL vsql_mcp.allow_write = OFF;
+SET GLOBAL vsql_mcp.query_timeout = 30;
+UPDATE mcpsec.t1 SET name = CONCAT('row', id);
+
+--echo # --- empty states ---
+CREATE TABLE mcpsec.empty_t (id INT, note VARCHAR(20));
+CREATE SCHEMA mcpempty;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port empty
+DROP SCHEMA mcpempty;
+DROP TABLE mcpsec.empty_t;
+
+--echo # --- db_url not configured ---
+SET GLOBAL vsql_mcp.db_url = '';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port not_configured unset
+
+--echo # --- db_url malformed ---
+SET GLOBAL vsql_mcp.db_url = 'not-a-dsn';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port not_configured malformed
+
+--echo # --- db_url points at a closed port ---
+SET GLOBAL vsql_mcp.db_url = 'mysql://mcpuser@127.0.0.1:59999';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port not_configured refused
+
+--echo # --- db_url has the wrong password ---
+--disable_query_log
+--eval SET GLOBAL vsql_mcp.db_url = CONCAT('mysql://mcpuser:wrongpw@127.0.0.1:', @@port)
+--enable_query_log
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port not_configured denied
+
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_err.py
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_client.py
+--source mcp_env_cleanup.inc

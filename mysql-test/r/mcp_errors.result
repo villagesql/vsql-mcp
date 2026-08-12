@@ -1,0 +1,117 @@
+INSTALL EXTENSION vsql_mcp;
+CREATE USER mcpuser@'127.0.0.1';
+GRANT SELECT, SHOW VIEW ON *.* TO mcpuser@'127.0.0.1';
+CREATE SCHEMA mcpsec;
+GRANT INSERT, UPDATE, DELETE ON mcpsec.* TO mcpuser@'127.0.0.1';
+CREATE TABLE mcpsec.t1 (id INT PRIMARY KEY, name VARCHAR(50));
+INSERT INTO mcpsec.t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+CREATE TABLE mcpsec.secret (id INT PRIMARY KEY, password_hash VARCHAR(80), KEY ix_ph (password_hash));
+INSERT INTO mcpsec.secret VALUES (1, 'hunter2hash');
+CREATE SCHEMA mcpalt;
+CREATE TABLE mcpalt.t1 (id INT PRIMARY KEY, tag VARCHAR(30));
+INSERT INTO mcpalt.t1 VALUES (1, 'other-schema-row');
+CREATE VIEW mcpsec.v_leak AS SELECT id, tag FROM mcpalt.t1;
+CREATE VIEW mcpsec.v_secret AS SELECT password_hash FROM mcpsec.secret;
+SET GLOBAL vsql_mcp.port = 0;
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+# --- engine errors surface as tool errors ---
+error_syntax_http_200: PASS
+error_syntax_is_tool_error: PASS
+error_syntax_carries_engine_code: PASS
+error_syntax_server_still_serving: PASS
+error_missing_table_http_200: PASS
+error_missing_table_is_tool_error: PASS
+error_missing_table_carries_engine_code: PASS
+error_missing_table_server_still_serving: PASS
+error_missing_column_http_200: PASS
+error_missing_column_is_tool_error: PASS
+error_missing_column_carries_engine_code: PASS
+error_missing_column_server_still_serving: PASS
+error_ambiguous_column_http_200: PASS
+error_ambiguous_column_is_tool_error: PASS
+error_ambiguous_column_carries_engine_code: PASS
+error_ambiguous_column_server_still_serving: PASS
+error_wrong_arg_count_http_200: PASS
+error_wrong_arg_count_is_tool_error: PASS
+error_wrong_arg_count_carries_engine_code: PASS
+error_wrong_arg_count_server_still_serving: PASS
+known_error_wrapped_in_driver_debug_format: PASS
+known_division_by_zero_is_null_not_error: PASS
+guardrail_rejection_is_tool_error_over_200: PASS
+# --- read timeout ---
+SET GLOBAL vsql_mcp.query_timeout = 2;
+read_timeout_returns_an_error: PASS
+read_timeout_bounded: PASS
+known_read_timeout_message_is_not_the_intended_one: PASS
+known_read_timeout_surfaces_driver_internals: PASS
+read_timeout_next_call_succeeds: PASS
+read_timeout_next_query_correct: PASS
+# --- expensive plan, not just SLEEP ---
+cross_join_timeout_returns_an_error: PASS
+cross_join_timeout_bounded: PASS
+cross_join_timeout_server_still_serving: PASS
+# --- write timeout: the call is bounded, the statement is not ---
+SET GLOBAL vsql_mcp.allow_write = ON;
+write_timeout_returns_an_error: PASS
+write_timeout_bounded_by_client_read_timeout: PASS
+known_write_timeout_message_is_not_the_intended_one: PASS
+known_write_timeout_reported_as_failure: PASS
+# the tool reported failure; wait for the abandoned UPDATE to land anyway
+SELECT COUNT(*) AS rows_written_after_reported_failure
+FROM mcpsec.t1 WHERE name = 'TIMEDOUT';
+rows_written_after_reported_failure
+3
+SET GLOBAL vsql_mcp.allow_write = OFF;
+SET GLOBAL vsql_mcp.query_timeout = 30;
+UPDATE mcpsec.t1 SET name = CONCAT('row', id);
+# --- empty states ---
+CREATE TABLE mcpsec.empty_t (id INT, note VARCHAR(20));
+CREATE SCHEMA mcpempty;
+empty_no_matching_rows_has_columns: PASS
+empty_no_matching_rows_counted: PASS
+empty_table_has_columns: PASS
+empty_schema_lists_no_tables: PASS
+empty_schema_overview_says_none: PASS
+describe_table_on_view: PASS
+empty_aggregate_returns_null_row: PASS
+DROP SCHEMA mcpempty;
+DROP TABLE mcpsec.empty_t;
+# --- db_url not configured ---
+SET GLOBAL vsql_mcp.db_url = '';
+db_url_failure_is_prompt: PASS
+db_url_failure_is_tool_error: PASS
+db_url_message: unset
+db_url_unset_message: PASS
+# --- db_url malformed ---
+SET GLOBAL vsql_mcp.db_url = 'not-a-dsn';
+db_url_failure_is_prompt: PASS
+db_url_failure_is_tool_error: PASS
+db_url_message: malformed
+db_url_malformed_message: PASS
+# --- db_url points at a closed port ---
+SET GLOBAL vsql_mcp.db_url = 'mysql://mcpuser@127.0.0.1:59999';
+db_url_failure_is_prompt: PASS
+db_url_failure_is_tool_error: PASS
+db_url_message: refused
+db_url_refused_message: PASS
+# --- db_url has the wrong password ---
+db_url_failure_is_prompt: PASS
+db_url_failure_is_tool_error: PASS
+db_url_message: denied
+db_url_denied_message: PASS
+db_url_denied_names_access_denied: PASS
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+SET GLOBAL vsql_mcp.schema = '';
+SET GLOBAL vsql_mcp.allowed_tables = '';
+SET GLOBAL vsql_mcp.allow_write = OFF;
+SET GLOBAL vsql_mcp.require_auth = OFF;
+SET GLOBAL vsql_mcp.bearer_token = '';
+SET GLOBAL vsql_mcp.max_rows = 1000;
+SET GLOBAL vsql_mcp.query_timeout = 30;
+SET GLOBAL vsql_mcp.db_url = '';
+DROP VIEW mcpsec.v_secret;
+DROP VIEW mcpsec.v_leak;
+DROP SCHEMA mcpalt;
+DROP SCHEMA mcpsec;
+DROP USER mcpuser@'127.0.0.1';
+UNINSTALL EXTENSION vsql_mcp;

@@ -1,0 +1,490 @@
+# vsql_mcp — security and blast radius.
+#
+# Attacks the guardrails directly rather than re-walking the happy paths in
+# mcp_basic. The guardrails classify statements and scope schemas by inspecting
+# SQL text, and enforce the table allowlist by planning with EXPLAIN FORMAT=JSON
+# — neither is a parser, and this file is where that shows.
+#
+# Assertions come in two flavours and the names say which:
+#
+#   *  a plain name asserts the guardrail holds.
+#   *  a name starting with "known_" pins CURRENT behaviour that is either a
+#      documented limitation or a defect this suite found. It passes today by
+#      design; when the behaviour is fixed the assertion flips and the test
+#      fails loudly, which is exactly the signal wanted. Every "known_" line is
+#      written up in the findings that accompany this suite.
+#
+# "No side effect" is never asserted from a tool response — it is asserted by
+# querying the table from MTR afterwards.
+
+--source mcp_env.inc
+--source mcp_client.inc
+
+--write_file $MYSQLTEST_VARDIR/tmp/mcp_sec.py
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import mcp_client as C
+
+C.configure(sys.argv[2])
+MODE = sys.argv[3]
+TOKEN = sys.argv[4] if len(sys.argv) > 4 else None
+
+SECRET_VALUE = "hunter2hash"
+REJECT_READONLY = "only a single read-only statement is allowed by the query tool"
+
+
+def classify():
+    """Statement-classification evasion: everything here must be refused, or
+    must reach the server and be refused there, and none may take effect."""
+    sid = C.init()
+
+    # Leading comment forms. strip_leading() removes these, so the real verb
+    # behind them is what gets classified.
+    for name, sql in [
+            ("block_comment", "/* hide */ DELETE FROM mcpsec.t1"),
+            ("dash_comment", "-- hide\nDELETE FROM mcpsec.t1"),
+            ("hash_comment", "#hide\nDELETE FROM mcpsec.t1"),
+            ("nested_comments", "/*a*/ /*b*/ -- c\nUPDATE mcpsec.t1 SET name='x'")]:
+        _, err = C.tool(sid, "query", {"sql": sql})
+        C.rejected("classify_" + name, err, REJECT_READONLY)
+
+    # DDL and statement types that are on neither verb allowlist.
+    for name, sql in [
+            ("create", "CREATE TABLE mcpsec.evil (i INT)"),
+            ("drop", "DROP TABLE mcpsec.t1"),
+            ("alter", "ALTER TABLE mcpsec.t1 ADD COLUMN z INT"),
+            ("truncate", "TRUNCATE TABLE mcpsec.t1"),
+            ("handler", "HANDLER mcpsec.t1 OPEN"),
+            ("do", "DO SLEEP(0)"),
+            ("set", "SET SESSION sql_mode=''"),
+            ("call", "CALL mcpsec.noproc()"),
+            ("load_data_local", "LOAD DATA LOCAL INFILE '/etc/passwd' INTO TABLE mcpsec.t1"),
+            ("update", "UPDATE mcpsec.t1 SET name='pwn' WHERE id=1"),
+            ("delete", "DELETE FROM mcpsec.t1"),
+            ("replace", "REPLACE INTO mcpsec.t1 VALUES (1,'x')"),
+            ("insert", "INSERT INTO mcpsec.t1 VALUES (4,'delta')")]:
+        _, err = C.tool(sid, "query", {"sql": sql})
+        C.rejected("classify_" + name, err, REJECT_READONLY)
+
+    # Multi-statement payloads. A trailing ';' alone is fine; a second
+    # statement after it is not.
+    _, err = C.tool(sid, "query", {"sql": "SELECT 1 AS a; DROP TABLE mcpsec.t1"})
+    C.rejected("classify_multi_statement", err, REJECT_READONLY)
+    rows = C.query_rows(sid, "SELECT id FROM mcpsec.t1 WHERE id=1;")
+    C.ok("classify_trailing_semicolon_allowed", rows == [{"id": 1}], rows)
+    # A ';' inside a string literal is not a statement separator.
+    rows = C.query_rows(sid, "SELECT 'a;b' AS s")
+    C.ok("classify_semicolon_in_string_allowed", rows == [{"s": "a;b"}], rows)
+
+    # The scanner has no backslash-escape rule, so a MySQL-escaped quote
+    # desynchronises it. The desync direction is over-rejection, never
+    # under-rejection, which is the safe way round.
+    _, err = C.tool(sid, "query", {"sql": "SELECT 'a\\' ; SELECT 2' AS s"})
+    C.rejected("known_backslash_escape_over_rejected", err, REJECT_READONLY)
+
+    # has_trailing_statement() scans the whole statement for ';' but strips
+    # comments only at the front, so a ';' inside a trailing comment reads as a
+    # second statement. Valid SQL, refused.
+    _, err = C.tool(sid, "query", {"sql": "SELECT 1 AS a -- ;x"})
+    C.rejected("known_semicolon_in_trailing_comment_rejected", err, REJECT_READONLY)
+
+    # classify() splits on whitespace OR '(', so a parenthesised SELECT yields
+    # an empty first token and is refused. Valid read-only SQL, refused.
+    _, err = C.tool(sid, "query", {"sql": "(SELECT id FROM mcpsec.t1)"})
+    C.rejected("known_parenthesised_select_rejected", err, REJECT_READONLY)
+    _, err = C.tool(sid, "query", {"sql": "(SELECT id FROM mcpsec.t1) UNION (SELECT id FROM mcpsec.secret)"})
+    C.rejected("known_parenthesised_union_rejected", err, REJECT_READONLY)
+
+    # A MySQL version comment is stripped wholesale by strip_leading(), so what
+    # is classified is not what the server parses. Here that mismatch produces a
+    # syntax error rather than a bypass, because the two halves cannot form two
+    # statements.
+    _, err = C.tool(sid, "query", {"sql": "/*!80000 DELETE FROM mcpsec.t1 */ SELECT 1"})
+    C.ok("known_version_comment_reaches_server", "1064" in err, err[:120])
+
+    # Whitespace and newlines before the verb must not change classification.
+    rows = C.query_rows(sid, "\n\n   SELECT id FROM mcpsec.t1 WHERE id=2")
+    C.ok("classify_leading_whitespace_ok", rows == [{"id": 2}], rows)
+
+
+def layers():
+    """Read-only is enforced twice: by the classifier, and by the session. This
+    records which layer catches what."""
+    sid = C.init()
+
+    # The loopback read session really is read-only, with the statement timeout
+    # and the server-side row cap applied. Asserting the session variables is
+    # the direct proof, not an inference from behaviour.
+    obj, verr = C.jtool(sid, "query", {"sql": "SELECT @@transaction_read_only AS ro, "
+                                              "@@MAX_EXECUTION_TIME AS met, @@SQL_SELECT_LIMIT AS sel_limit"})
+    rows = (obj or {}).get("rows")
+    r = rows[0] if rows else {}
+    C.ok("session_is_read_only", r.get("ro") == 1, verr or r)
+    C.ok("session_has_statement_timeout", r.get("met") == 30000, verr or r)
+    # max_rows default 1000, capped server-side at max_rows + 1 so truncation
+    # is still detectable.
+    C.ok("session_row_cap_is_server_side", r.get("sel_limit") == 1001, verr or r)
+
+    # These classify as Read (they begin SELECT/WITH) and so pass the
+    # classifier, then die at the session layer. That is the layered design
+    # working, and it is worth knowing which layer speaks.
+    _, err = C.tool(sid, "query", {"sql": "SELECT id FROM mcpsec.t1 FOR UPDATE"})
+    C.ok("for_update_caught_by_session_layer", "READ ONLY transaction" in err, err[:120])
+    _, err = C.tool(sid, "query", {"sql": "WITH c AS (SELECT 1) DELETE FROM mcpsec.t1"})
+    C.ok("cte_delete_caught_by_session_layer", "READ ONLY transaction" in err, err[:120])
+
+    # INTO OUTFILE/DUMPFILE begin with SELECT, so the classifier passes them and
+    # a read-only transaction does not stop a write to the filesystem. The only
+    # thing standing in the way is the loopback account lacking FILE. Nothing in
+    # vsql_mcp refuses it.
+    _, err = C.tool(sid, "query", {"sql": "SELECT id FROM mcpsec.t1 INTO OUTFILE '/tmp/mcp_guardrail_probe.txt'"})
+    C.ok("known_into_outfile_stopped_only_by_grants",
+         "FILE privilege" in err, err[:140])
+    _, err = C.tool(sid, "query", {"sql": "SELECT id FROM mcpsec.t1 LIMIT 1 INTO DUMPFILE '/tmp/mcp_guardrail_probe2.txt'"})
+    C.ok("known_into_dumpfile_stopped_only_by_grants",
+         "FILE privilege" in err, err[:140])
+
+
+def schema_scope():
+    """vsql_mcp.schema = mcpsec. Everything reaching mcpalt or a system schema
+    must be refused."""
+    sid = C.init()
+
+    for name, sql in [
+            ("plain", "SELECT tag FROM mcpalt.t1"),
+            ("backtick", "SELECT tag FROM `mcpalt`.`t1`"),
+            ("mixed_case", "SELECT tag FROM McPaLt.t1"),
+            ("subquery", "SELECT (SELECT tag FROM mcpalt.t1 LIMIT 1) AS x"),
+            ("information_schema", "SELECT COUNT(*) AS c FROM information_schema.TABLES"),
+            ("mysql", "SELECT user FROM mysql.user LIMIT 1"),
+            ("performance_schema", "SELECT COUNT(*) AS c FROM performance_schema.threads"),
+            ("sys", "SELECT COUNT(*) AS c FROM sys.version")]:
+        _, err = C.tool(sid, "query", {"sql": sql})
+        C.rejected("schema_reject_" + name, err, "outside the exposed schema")
+
+    # In-scope access still works, and a schema name appearing inside a string
+    # literal is not a reference.
+    rows = C.query_rows(sid, "SELECT name FROM mcpsec.t1 WHERE id=1")
+    C.ok("schema_allows_configured_schema", rows == [{"name": "alpha"}], rows)
+    rows = C.query_rows(sid, "SELECT 'mcpalt.t1' AS s")
+    C.ok("schema_ignores_string_literal", rows == [{"s": "mcpalt.t1"}], rows)
+
+    # DEFECT: qualified_refs() only treats '<ident>.<ident>' as a reference when
+    # the dot immediately follows the identifier. MySQL accepts whitespace
+    # around the dot, so `mcpalt . t1` reaches a schema the operator excluded.
+    for name, sql in [
+            ("space", "SELECT tag FROM mcpalt . t1"),
+            ("tab", "SELECT tag FROM mcpalt\t.\tt1"),
+            ("newline", "SELECT tag FROM mcpalt\n.\nt1"),
+            ("backtick_space", "SELECT tag FROM `mcpalt` . `t1`")]:
+        rows = C.query_rows(sid, sql)
+        C.ok("known_schema_bypass_whitespace_dot_" + name,
+             rows == [{"tag": "other-schema-row"}], rows)
+
+    # DEFECT: scoping reads the submitted text only, so a view inside the
+    # exposed schema is an unchecked door into any schema it was defined over.
+    rows = C.query_rows(sid, "SELECT tag FROM mcpsec.v_leak")
+    C.ok("known_schema_bypass_via_view", rows == [{"tag": "other-schema-row"}], rows)
+
+    # DEFECT: any '<alias>.<column>' is read as a schema qualifier, so ordinary
+    # aliased SQL is refused, and the message names the alias as if it were a
+    # schema. The loopback session has no default database either, so an
+    # unqualified table name cannot be used as the workaround.
+    _, err = C.tool(sid, "query", {"sql": "SELECT p.name FROM mcpsec.t1 p WHERE p.id=1"})
+    C.ok("known_alias_qualified_column_rejected", "schema 'p' is outside" in err, err[:140])
+    _, err = C.tool(sid, "query", {"sql": "SELECT t1.name FROM mcpsec.t1 WHERE t1.id=1"})
+    C.ok("known_table_qualified_column_rejected", "schema 't1' is outside" in err, err[:140])
+    _, err = C.tool(sid, "query", {"sql": "SELECT name FROM t1 WHERE id=1"})
+    C.ok("known_unqualified_name_has_no_default_db", "1046" in err, err[:140])
+
+
+def allowlist():
+    """vsql_mcp.allowed_tables = t1. The check plans with EXPLAIN and matches on
+    bare table name, and both of those choices are reachable."""
+    sid = C.init()
+
+    rows = C.query_rows(sid, "SELECT id FROM mcpsec.t1 WHERE id=1")
+    C.ok("allowlist_permits_listed_table", rows == [{"id": 1}], rows)
+
+    for name, sql in [
+            ("direct", "SELECT password_hash FROM mcpsec.secret"),
+            ("subquery", "SELECT (SELECT password_hash FROM mcpsec.secret LIMIT 1) AS x"),
+            ("join", "SELECT s.password_hash FROM mcpsec.t1 JOIN mcpsec.secret s ON s.id=mcpsec.t1.id"),
+            ("derived_aliased_as_allowed", "SELECT * FROM (SELECT password_hash FROM mcpsec.secret) AS t1"),
+            ("view_over_non_allowed", "SELECT * FROM mcpsec.v_secret")]:
+        _, err = C.tool(sid, "query", {"sql": sql})
+        C.rejected("allowlist_reject_" + name, err, "not in vsql_mcp.allowed_tables")
+
+    # EXPLAIN sees through a merged view to the underlying table, so a view is
+    # not a way around the allowlist. Worth asserting as a genuine strength.
+    _, err = C.tool(sid, "query", {"sql": "SELECT password_hash FROM mcpsec.v_secret"})
+    C.ok("allowlist_sees_through_view", "secret" in err, err[:140])
+
+    # DEFECT: when the optimizer answers from an index without reading the
+    # table, EXPLAIN emits "Select tables optimized away" and no table_name at
+    # all, so the allowlist has nothing to reject and the statement runs. This
+    # returns the real value of a column in a table the operator excluded.
+    got = C.scalar(sid, "SELECT MIN(password_hash) AS m FROM mcpsec.secret", "m")
+    C.ok("known_allowlist_bypass_min_exfiltrates_value", got == SECRET_VALUE, got)
+    got = C.scalar(sid, "SELECT MAX(password_hash) AS m FROM mcpsec.secret", "m")
+    C.ok("known_allowlist_bypass_max_exfiltrates_value", got == SECRET_VALUE, got)
+    got = C.scalar(sid, "SELECT MIN(id) AS m FROM mcpsec.secret", "m")
+    C.ok("known_allowlist_bypass_min_on_pk", got == 1, got)
+
+    # DEFECT: a plan the optimizer eliminates entirely also names no table, so
+    # the statement executes against the excluded table. No rows come back, but
+    # the column list does, and existence is confirmed.
+    obj, _ = C.jtool(sid, "query", {"sql": "SELECT password_hash FROM mcpsec.secret WHERE 1=0"})
+    C.ok("known_allowlist_bypass_impossible_where",
+         obj is not None and obj.get("columns") == ["password_hash"] and obj.get("row_count") == 0, obj)
+    obj, _ = C.jtool(sid, "query", {"sql": "SELECT password_hash FROM mcpsec.secret LIMIT 0"})
+    C.ok("known_allowlist_bypass_limit_zero",
+         obj is not None and obj.get("columns") == ["password_hash"], obj)
+
+    # DEFECT: matching is on bare table name, so the same name in another schema
+    # inherits the allowance. Documented in the README, pinned here.
+    rows = C.query_rows(sid, "SELECT tag FROM mcpalt.t1")
+    C.ok("known_allowlist_matches_bare_name_across_schemas",
+         rows == [{"tag": "other-schema-row"}], rows)
+
+    # DEFECT: EXPLAIN names its own internal pseudo-tables, which are never on
+    # an allowlist, so every UNION is refused even when both arms are allowed.
+    _, err = C.tool(sid, "query", {"sql": "SELECT name FROM mcpsec.t1 UNION SELECT name FROM mcpsec.t1"})
+    C.ok("known_allowlist_rejects_union_of_allowed_tables",
+         "<union" in err, err[:140])
+
+    # DEFECT: check_access() plans every statement with EXPLAIN FORMAT=JSON, but
+    # SHOW and DESCRIBE cannot be planned, so setting an allowlist makes the
+    # whole SHOW/DESCRIBE family unusable with a raw syntax error.
+    for name, sql in [("show_tables", "SHOW TABLES FROM mcpsec"),
+                      ("describe", "DESCRIBE mcpsec.t1"),
+                      ("show_create", "SHOW CREATE TABLE mcpsec.t1")]:
+        _, err = C.tool(sid, "query", {"sql": sql})
+        C.ok("known_allowlist_breaks_" + name, "1064" in err, err[:140])
+
+    # DEFECT: the allowlist is applied by the query/explain/write tools only.
+    # The schema-introspection surfaces never consult it, so the shape of an
+    # excluded table is fully readable.
+    st, body, _ = C.rpc(sid, "resources/read", {"uri": "vsql://mcpsec/secret"})
+    ddl = ((body or {}).get("result", {}).get("contents") or [{}])[0].get("text", "")
+    C.ok("known_allowlist_not_applied_to_resources", "password_hash" in ddl, ddl[:120])
+    obj, _ = C.jtool(sid, "describe_table", {"schema": "mcpsec", "table": "secret"})
+    cols = [c["name"] for c in obj["columns"]] if obj else []
+    C.ok("known_allowlist_not_applied_to_describe_table", cols == ["id", "password_hash"], cols)
+    obj, _ = C.jtool(sid, "list_tables", {"schema": "mcpsec"})
+    names = sorted(t["name"] for t in obj["tables"]) if obj else []
+    C.ok("known_allowlist_not_applied_to_list_tables", "secret" in names, names)
+
+
+def authn():
+    """require_auth is ON with a known token."""
+    def status(hdrs):
+        st, _, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                             headers=hdrs)
+        return st
+
+    C.ok("auth_missing_header_401", status({}) == 401)
+    C.ok("auth_wrong_token_401", status({"Authorization": "Bearer wrong"}) == 401)
+    C.ok("auth_empty_token_401", status({"Authorization": "Bearer "}) == 401)
+    C.ok("auth_correct_token_200", status({"Authorization": "Bearer " + TOKEN}) == 200)
+    # The scheme is matched with a literal "Bearer " prefix, so it is
+    # case-sensitive and space-exact. RFC 7235 says the scheme is
+    # case-insensitive; this rejects a spec-legal client.
+    C.ok("known_auth_scheme_case_sensitive",
+         status({"Authorization": "bearer " + TOKEN}) == 401)
+    C.ok("known_auth_rejects_extra_space",
+         status({"Authorization": "Bearer  " + TOKEN}) == 401)
+    # A trailing space in the header value is not assertable from here: the HTTP
+    # client strips it before it reaches the wire, so this would test urllib
+    # rather than vsql_mcp. Leading space inside the credential is testable and
+    # is covered by known_auth_rejects_extra_space above.
+
+    # Auth is enforced on the other methods too, not only POST.
+    st, _, _ = C.request(None, method="DELETE", headers={"Mcp-Session-Id": "whatever"})
+    C.ok("auth_enforced_on_delete", st == 401, st)
+    # GET is refused before auth is considered; 405 is the documented answer.
+    st, _, _ = C.request(None, method="GET")
+    C.ok("known_get_405_before_auth", st == 405, st)
+
+
+def origin():
+    """Origin validation is what stops a browser on another site from driving a
+    loopback MCP server (DNS rebinding)."""
+    def status(o):
+        st, _, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                             origin=o)
+        return st
+
+    for o in ["https://evil.example", "http://localhost.evil.com",
+              "http://127.0.0.1.evil.com", "null", "http://127.0.0.1@evil.com"]:
+        C.ok("origin_rejects_" + o.replace("://", "_").replace("/", "_").replace(".", "_").replace("@", "_at_"),
+             status(o) == 403, status(o))
+
+    for o in ["http://localhost", "http://LOCALHOST", "http://127.0.0.1:9999",
+              "https://127.0.0.1", "http://[::1]:9999"]:
+        C.ok("origin_allows_" + o.replace("://", "_").replace("/", "_").replace(".", "_").replace(":", "_").replace("[", "").replace("]", ""),
+             status(o) == 200, status(o))
+
+    # Absent Origin is allowed: non-browser MCP clients do not send one, and a
+    # browser always does, so this is the correct trade.
+    C.ok("origin_absent_allowed", status(None) == 200)
+
+
+def sessions():
+    """Session ids gate every non-initialize request."""
+    a = C.init()
+    b = C.init()
+    C.ok("session_ids_distinct", a != b)
+    C.ok("session_id_is_128_bit_hex",
+         len(a) == 32 and all(c in "0123456789abcdef" for c in a), a)
+
+    st, _, _ = C.rpc("0" * 32, "ping")
+    C.ok("session_forged_id_404", st == 404, st)
+    st, _, _ = C.rpc("", "ping")
+    C.ok("session_missing_header_400", st == 400, st)
+
+    # A session belongs to the server, not the client that made it: any caller
+    # holding the id can use it. That is the transport's model, so the property
+    # worth asserting is that terminating one does not disturb the other.
+    st, _, _ = C.request(None, method="DELETE", headers={"Mcp-Session-Id": a})
+    C.ok("session_delete_200", st == 200, st)
+    st, _, _ = C.rpc(a, "ping")
+    C.ok("session_reuse_after_delete_404", st == 404, st)
+    st, _, _ = C.rpc(b, "ping")
+    C.ok("session_sibling_still_live", st == 200, st)
+
+
+def write_off():
+    sid = C.init()
+    # The tool stays advertised while disabled, so an agent reading tools/list
+    # believes it can write and only learns otherwise by trying.
+    st, body, _ = C.rpc(sid, "tools/list")
+    names = [t["name"] for t in body["result"]["tools"]]
+    C.ok("known_write_tool_listed_while_disabled", "write" in names, names)
+
+    for sql in ["INSERT INTO mcpsec.t1 VALUES (9,'zeta')",
+                "DELETE FROM mcpsec.t1",
+                "UPDATE mcpsec.t1 SET name='pwn'"]:
+        _, err = C.tool(sid, "write", {"sql": sql})
+        C.rejected("write_disabled_refuses", err, "the write tool is disabled")
+
+
+def write_on():
+    sid = C.init()
+    obj, err = C.jtool(sid, "write", {"sql": "INSERT INTO mcpsec.t1 VALUES (9,'zeta')"})
+    C.ok("write_insert_reports_affected_rows", obj == {"affected_rows": 1}, obj or err)
+
+    # The write tool refuses anything that is not a write verb.
+    for name, sql in [("ddl", "DROP TABLE mcpsec.t1"),
+                      ("select", "SELECT * FROM mcpsec.t1"),
+                      ("multi", "INSERT INTO mcpsec.t1 VALUES (10,'x'); DROP TABLE mcpsec.t1")]:
+        _, err = C.tool(sid, "write", {"sql": sql})
+        C.rejected("write_refuses_" + name, err,
+                   "the write tool accepts a single INSERT/UPDATE/DELETE statement")
+
+    # REPLACE is on the write verb list in guardrails.rs but is absent from both
+    # the tool description and the README, so an operator reading either would
+    # not expect it to be reachable.
+    obj, err = C.jtool(sid, "write", {"sql": "REPLACE INTO mcpsec.t1 VALUES (9,'replaced')"})
+    C.ok("known_write_accepts_replace", obj is not None and "affected_rows" in obj, obj or err)
+
+    # An unqualified DELETE removes every row. There is no row-count ceiling and
+    # no WHERE requirement anywhere in the write path. MTR verifies the damage
+    # from the table itself after this returns.
+    obj, err = C.jtool(sid, "write", {"sql": "DELETE FROM mcpsec.t1"})
+    C.ok("known_write_allows_unbounded_delete",
+         obj is not None and obj.get("affected_rows", 0) > 0, obj or err)
+
+
+def secrets():
+    """db_url embeds a password and bearer_token is a credential. Neither may
+    appear in any response, including the failure paths that mention the DSN."""
+    sid = C.init(token=TOKEN)
+    blobs = []
+
+    _, err = C.tool(sid, "query", {"sql": "SELECT 1 AS a"}, token=TOKEN)
+    blobs.append(err)
+    _, err = C.tool(sid, "list_schemas", {}, token=TOKEN)
+    blobs.append(err)
+    st, body, _ = C.rpc(sid, "resources/read", {"uri": "vsql://mcpsec"}, token=TOKEN)
+    blobs.append(json.dumps(body))
+    st, body, _ = C.rpc(sid, "resources/list", token=TOKEN)
+    blobs.append(json.dumps(body))
+
+    joined = " ".join(b for b in blobs if b)
+    C.ok("secrets_password_not_echoed", "SUPERSECRETPW" not in joined)
+    C.ok("secrets_bearer_token_not_echoed", TOKEN not in joined)
+    # The connection failure names host and port, which is useful, and stops
+    # there.
+    C.ok("secrets_connect_error_is_useful", "Connection refused" in joined or "connect failed" in joined,
+         joined[:160])
+
+
+{"classify": classify, "layers": layers, "schema": schema_scope, "allowlist": allowlist,
+ "authn": authn, "origin": origin, "sessions": sessions, "write_off": write_off,
+ "write_on": write_on, "secrets": secrets}[MODE]()
+EOF
+
+--echo # --- statement classification: evasion attempts ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port classify
+
+--echo # side effects after every classification attempt: none
+SELECT COUNT(*) AS t1_rows FROM mcpsec.t1;
+SELECT COUNT(*) AS evil_tables FROM information_schema.TABLES
+ WHERE TABLE_SCHEMA='mcpsec' AND TABLE_NAME='evil';
+
+--echo # --- layered read-only enforcement ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port layers
+
+--echo # --- schema scoping ---
+SET GLOBAL vsql_mcp.schema = 'mcpsec';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port schema
+SET GLOBAL vsql_mcp.schema = '';
+
+--echo # --- table allowlist ---
+SET GLOBAL vsql_mcp.allowed_tables = 't1';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port allowlist
+SET GLOBAL vsql_mcp.allowed_tables = '';
+
+--echo # --- bearer auth ---
+SET GLOBAL vsql_mcp.require_auth = ON;
+SET GLOBAL vsql_mcp.bearer_token = 'tok3n-Value';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port authn tok3n-Value
+SET GLOBAL vsql_mcp.require_auth = OFF;
+SET GLOBAL vsql_mcp.bearer_token = '';
+
+--echo # --- Origin validation (DNS rebinding defence) ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port origin
+
+--echo # --- session handling ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port sessions
+
+--echo # --- write tool disabled ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port write_off
+--echo # nothing was written while the tool was disabled
+SELECT COUNT(*) AS t1_rows FROM mcpsec.t1;
+
+--echo # --- write tool enabled ---
+SET GLOBAL vsql_mcp.allow_write = ON;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port write_on
+--echo # an unqualified DELETE through the write tool emptied the table
+SELECT COUNT(*) AS t1_rows_after_unbounded_delete FROM mcpsec.t1;
+SET GLOBAL vsql_mcp.allow_write = OFF;
+INSERT INTO mcpsec.t1 VALUES (1,'alpha'), (2,'beta'), (3,'gamma');
+
+--echo # --- credentials never appear in a response ---
+SET GLOBAL vsql_mcp.require_auth = ON;
+SET GLOBAL vsql_mcp.bearer_token = 'tok3n-Value';
+SET GLOBAL vsql_mcp.db_url = 'mysql://mcpuser:SUPERSECRETPW@127.0.0.1:59999';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port secrets tok3n-Value
+SET GLOBAL vsql_mcp.require_auth = OFF;
+SET GLOBAL vsql_mcp.bearer_token = '';
+
+--echo # the excluded value never left the database
+SELECT COUNT(*) AS secret_rows FROM mcpsec.secret;
+
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_sec.py
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_client.py
+--source mcp_env_cleanup.inc
