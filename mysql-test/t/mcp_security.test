@@ -281,18 +281,58 @@ def allowlist():
         _, err = C.tool(sid, "query", {"sql": sql})
         C.ok("known_allowlist_breaks_" + name, "1064" in err, err[:140])
 
-    # DEFECT: the allowlist is applied by the query/explain/write tools only.
-    # The schema-introspection surfaces never consult it, so the shape of an
-    # excluded table is fully readable.
+    # The allowlist governs the introspection surface too. Column names are how
+    # an agent finds what to ask for, so leaving them readable would hand back
+    # the discovery half of reaching the data.
     st, body, _ = C.rpc(sid, "resources/read", {"uri": "vsql://mcpsec/secret"})
-    ddl = ((body or {}).get("result", {}).get("contents") or [{}])[0].get("text", "")
-    C.ok("known_allowlist_not_applied_to_resources", "password_hash" in ddl, ddl[:120])
-    obj, _ = C.jtool(sid, "describe_table", {"schema": "mcpsec", "table": "secret"})
-    cols = [c["name"] for c in obj["columns"]] if obj else []
-    C.ok("known_allowlist_not_applied_to_describe_table", cols == ["id", "password_hash"], cols)
+    msg = (body or {}).get("error", {}).get("message", "")
+    C.ok("allowlist_applied_to_resource_read",
+         "not in vsql_mcp.allowed_tables" in msg, body)
+    C.ok("allowlist_resource_read_leaks_no_ddl",
+         "password_hash" not in json.dumps(body), json.dumps(body)[:120])
+
+    _, err = C.tool(sid, "describe_table", {"schema": "mcpsec", "table": "secret"})
+    C.rejected("allowlist_applied_to_describe_table", err, "not in vsql_mcp.allowed_tables")
+
+    # A listing narrows instead of failing: the excluded table is simply absent.
     obj, _ = C.jtool(sid, "list_tables", {"schema": "mcpsec"})
     names = sorted(t["name"] for t in obj["tables"]) if obj else []
-    C.ok("known_allowlist_not_applied_to_list_tables", "secret" in names, names)
+    C.ok("allowlist_filters_list_tables", names == ["t1"], names)
+
+    # resources/list only enumerates tables when a single schema is exposed;
+    # with none configured it lists schemas alone, so no table URI should name
+    # the excluded table either way.
+    st, body, _ = C.rpc(sid, "resources/list")
+    uris = [r["uri"] for r in body["result"]["resources"]]
+    C.ok("allowlist_resources_list_names_no_excluded_table",
+         all("/secret" not in u for u in uris), uris)
+
+    # The allowed table stays fully reachable through the same surfaces.
+    obj, err = C.jtool(sid, "describe_table", {"schema": "mcpsec", "table": "t1"})
+    cols = [c["name"] for c in obj["columns"]] if obj else []
+    C.ok("allowlist_permits_describe_of_allowed_table", cols == ["id", "name"], cols or err)
+    st, body, _ = C.rpc(sid, "resources/read", {"uri": "vsql://mcpsec/t1"})
+    C.ok("allowlist_permits_resource_read_of_allowed_table",
+         "CREATE TABLE" in ((body.get("result", {}).get("contents") or [{}])[0].get("text", "")),
+         body)
+
+
+def scoped_allowlist():
+    """schema = mcpsec AND allowed_tables = t1 together. This is the only
+    configuration in which resources/list enumerates tables, so it is where the
+    listing filter is visible."""
+    sid = C.init()
+    st, body, _ = C.rpc(sid, "resources/list")
+    uris = [r["uri"] for r in body["result"]["resources"]]
+    C.ok("scoped_allowlist_lists_allowed_table", "vsql://mcpsec/t1" in uris, uris)
+    C.ok("scoped_allowlist_omits_excluded_table", "vsql://mcpsec/secret" not in uris, uris)
+    C.ok("scoped_allowlist_omits_excluded_view", "vsql://mcpsec/v_secret" not in uris, uris)
+    C.ok("scoped_allowlist_lists_only_exposed_schema",
+         [u for u in uris if "/" not in u[len("vsql://"):]] == ["vsql://mcpsec"], uris)
+
+    obj, _ = C.jtool(sid, "list_tables", {})
+    names = sorted(t["name"] for t in obj["tables"]) if obj else []
+    C.ok("scoped_allowlist_list_tables_filtered", names == ["t1"], names)
 
 
 def authn():
@@ -440,8 +480,9 @@ def secrets():
 
 
 {"classify": classify, "layers": layers, "schema": schema_scope, "allowlist": allowlist,
- "authn": authn, "origin": origin, "sessions": sessions, "write_off": write_off,
- "write_on": write_on, "secrets": secrets}[MODE]()
+ "scoped_allowlist": scoped_allowlist, "authn": authn, "origin": origin,
+ "sessions": sessions, "write_off": write_off, "write_on": write_on,
+ "secrets": secrets}[MODE]()
 EOF
 
 --echo # --- statement classification: evasion attempts ---
@@ -463,6 +504,11 @@ SET GLOBAL vsql_mcp.schema = '';
 --echo # --- table allowlist ---
 SET GLOBAL vsql_mcp.allowed_tables = 't1';
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port allowlist
+
+--echo # --- schema and allowlist together ---
+SET GLOBAL vsql_mcp.schema = 'mcpsec';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port scoped_allowlist
+SET GLOBAL vsql_mcp.schema = '';
 SET GLOBAL vsql_mcp.allowed_tables = '';
 
 --echo # --- bearer auth ---

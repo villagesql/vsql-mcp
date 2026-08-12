@@ -34,6 +34,9 @@ pub fn list(cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Json {
         if let Ok(rows) = executor::tables_in_schema(exec, &cfg.schema, cfg.query_timeout) {
             for row in &rows.rows {
                 if let Some(table) = row.get("TABLE_NAME").and_then(Json::as_str) {
+                    if !crate::guardrails::table_allowed(table, &cfg.allowed_tables) {
+                        continue;
+                    }
                     resources.push(json!({
                         "uri": format!("vsql://{}/{table}", cfg.schema),
                         "name": format!("{}.{table}", cfg.schema),
@@ -81,7 +84,14 @@ fn read_uri(uri: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<
     }
 
     match table {
-        Some(table) if !table.is_empty() => table_ddl(schema, table, cfg, exec),
+        Some(table) if !table.is_empty() => {
+            // A table's DDL is as much a disclosure as its rows, so the
+            // allowlist applies here exactly as it does to the query tool.
+            if !crate::guardrails::table_allowed(table, &cfg.allowed_tables) {
+                return Err(format!("table '{table}' is not in vsql_mcp.allowed_tables"));
+            }
+            table_ddl(schema, table, cfg, exec)
+        }
         _ => schema_overview(schema, cfg, exec),
     }
 }

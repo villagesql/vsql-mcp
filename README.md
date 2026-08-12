@@ -122,7 +122,14 @@ Applied to every `query`, `explain`, and `write` call:
   rejected.
 - **Table allowlist.** With `allowed_tables` set, the statement is planned with
   `EXPLAIN FORMAT=JSON` and every table it touches (joins and subqueries
-  included) must be on the list. Matching is on the table name.
+  included) must be on the list. When the optimizer answers without naming a
+  table — `MIN()`/`MAX()` from an index, an impossible `WHERE`, `LIMIT 0` — the
+  tables named in the statement text are checked instead, so an elided plan is
+  not a way past the list. Matching is on the table name.
+
+  The allowlist also governs what an agent can learn about a table, not only
+  what it can read: `describe_table` and `vsql://<schema>/<table>` refuse an
+  excluded table, and `list_tables` and `resources/list` omit it.
 - **Row cap.** `max_rows` caps a `query` result and marks it `truncated`.
 - **Statement timeout.** `query_timeout` bounds each call via
   `MAX_EXECUTION_TIME` and a client read timeout.

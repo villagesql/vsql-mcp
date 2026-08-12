@@ -151,6 +151,13 @@ fn list_tables(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Re
     let tables: Vec<Json> = rows
         .rows
         .iter()
+        // A listing narrows rather than fails: an excluded table is simply not
+        // offered, so an agent never learns it exists.
+        .filter(|r| {
+            r.get("TABLE_NAME")
+                .and_then(Json::as_str)
+                .is_some_and(|t| guardrails::table_allowed(t, &cfg.allowed_tables))
+        })
         .map(|r| {
             json!({
                 "name": field(r, "TABLE_NAME"),
@@ -165,6 +172,11 @@ fn list_tables(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Re
 fn describe_table(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
     let table = arg_str(args, "table")?;
     let schema = effective_schema(args.get("schema").and_then(Json::as_str), cfg)?;
+    // The allowlist governs what an agent may learn about, not only what it may
+    // read: column names are the discovery half of reaching the data.
+    if !guardrails::table_allowed(table, &cfg.allowed_tables) {
+        return Err(format!("table '{table}' is not in vsql_mcp.allowed_tables"));
+    }
     let rows = exec.read_params(
         "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, COLUMN_COMMENT \
          FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \

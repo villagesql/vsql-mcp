@@ -105,9 +105,21 @@ allowlist_rejects_union_reaching_excluded_table: PASS
 known_allowlist_breaks_show_tables: PASS
 known_allowlist_breaks_describe: PASS
 known_allowlist_breaks_show_create: PASS
-known_allowlist_not_applied_to_resources: PASS
-known_allowlist_not_applied_to_describe_table: PASS
-known_allowlist_not_applied_to_list_tables: PASS
+allowlist_applied_to_resource_read: PASS
+allowlist_resource_read_leaks_no_ddl: PASS
+allowlist_applied_to_describe_table: PASS
+allowlist_filters_list_tables: PASS
+allowlist_resources_list_names_no_excluded_table: PASS
+allowlist_permits_describe_of_allowed_table: PASS
+allowlist_permits_resource_read_of_allowed_table: PASS
+# --- schema and allowlist together ---
+SET GLOBAL vsql_mcp.schema = 'mcpsec';
+scoped_allowlist_lists_allowed_table: PASS
+scoped_allowlist_omits_excluded_table: PASS
+scoped_allowlist_omits_excluded_view: PASS
+scoped_allowlist_lists_only_exposed_schema: PASS
+scoped_allowlist_list_tables_filtered: PASS
+SET GLOBAL vsql_mcp.schema = '';
 SET GLOBAL vsql_mcp.allowed_tables = '';
 # --- bearer auth ---
 SET GLOBAL vsql_mcp.require_auth = ON;
