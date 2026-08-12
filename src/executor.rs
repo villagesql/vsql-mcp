@@ -95,7 +95,8 @@ impl<'a> Loopback<'a> {
     /// server-side row cap so a huge result set is never fetched only to be
     /// discarded. `row_cap` of `None` leaves `SQL_SELECT_LIMIT` at its default.
     fn read_conn(&self, timeout_s: u64, row_cap: Option<usize>) -> Result<Conn, String> {
-        let mut conn = self.connect(timeout_s)?;
+        // Headroom so MAX_EXECUTION_TIME below is the timer that fires.
+        let mut conn = self.connect(timeout_s.saturating_add(READ_TIMEOUT_HEADROOM_S))?;
         // Defense in depth beyond the statement allowlist: the session cannot
         // write regardless of what slips through classification.
         conn.query_drop("SET SESSION TRANSACTION READ ONLY")
@@ -127,7 +128,7 @@ impl QueryExecutor for Loopback<'_> {
 
     fn write(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
         let mut conn = self.connect(timeout_s)?;
-        conn.query_drop(sql).map_err(map_err)?;
+        conn.query_drop(sql).map_err(map_write_err)?;
         Ok(conn.affected_rows())
     }
 
@@ -138,19 +139,79 @@ impl QueryExecutor for Loopback<'_> {
     }
 }
 
-/// Turn a driver error into a message, translating the two timeout signatures
-/// (server-side MAX_EXECUTION_TIME = error 3024, and the client read timeout =
-/// a would-block/timed-out IO error) into one clear line an agent can act on.
+/// Extra seconds the client read timeout gets over the server-side statement
+/// timeout, so `MAX_EXECUTION_TIME` is what stops a slow read. Without the gap
+/// the two expire together and the client wins, which turns a clean server-side
+/// kill into a socket timeout. Reads only: `MAX_EXECUTION_TIME` does not apply
+/// to a write, so giving the write path headroom would only delay it.
+const READ_TIMEOUT_HEADROOM_S: u64 = 5;
+
+/// The kind of the first `io::Error` in this error's source chain, if any.
+/// The driver reports a client read timeout as a `CodecError` wrapping the IO
+/// error rather than as `Error::IoError`, so matching the outer variant alone
+/// misses it — which is why a timed-out statement used to reach the agent as
+/// the driver's internal wording.
+fn io_kind_of(e: &mysql::Error) -> Option<ErrorKind> {
+    match e {
+        mysql::Error::IoError(io) => Some(io.kind()),
+        // `mysql::Error` itself does not implement `source()`, so the chain has
+        // to be entered at the variant that owns the IO error. `PacketCodecError`
+        // does implement it, which is enough to reach the `io::Error` without
+        // naming that type here.
+        mysql::Error::CodecError(codec) => std::error::Error::source(codec)
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .map(std::io::Error::kind),
+        _ => None,
+    }
+}
+
+/// True when the statement ran out of time, whichever timer fired: the
+/// server-side `MAX_EXECUTION_TIME` (error 3024) or the client read timeout.
+fn is_timeout(e: &mysql::Error) -> bool {
+    if let mysql::Error::MySqlError(db) = e {
+        if db.code == 3024 {
+            return true;
+        }
+    }
+    matches!(
+        io_kind_of(e),
+        Some(ErrorKind::WouldBlock | ErrorKind::TimedOut)
+    )
+}
+
+/// Render a server error as the engine's own sentence. The driver's Display is
+/// a Rust debug wrapper (`MySqlError { ERROR 1146 (42S02): ... }`), and this is
+/// text an agent reads and acts on, so the wrapper comes off.
+fn describe(e: mysql::Error) -> String {
+    match e {
+        mysql::Error::MySqlError(db) => {
+            format!("ERROR {} ({}): {}", db.code, db.state, db.message)
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Error mapping for the read path, where a timeout means the statement was
+/// stopped.
 fn map_err(e: mysql::Error) -> String {
-    let timed_out = match &e {
-        mysql::Error::MySqlError(db) => db.code == 3024,
-        mysql::Error::IoError(io) => matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
-        _ => false,
-    };
-    if timed_out {
+    if is_timeout(&e) {
         return "statement exceeded vsql_mcp.query_timeout".to_owned();
     }
-    e.to_string()
+    describe(e)
+}
+
+/// Error mapping for the write path. `MAX_EXECUTION_TIME` does not apply to
+/// INSERT/UPDATE/DELETE, so a timeout here means the client stopped waiting —
+/// not that the statement stopped. Saying so is the difference between an agent
+/// retrying safely and an agent double-applying a write that already landed.
+fn map_write_err(e: mysql::Error) -> String {
+    if is_timeout(&e) {
+        return "timed out waiting for the write after vsql_mcp.query_timeout \
+                seconds; the statement may still be running on the server and \
+                may still commit, so its outcome is unknown"
+            .to_owned();
+    }
+    describe(e)
 }
 
 /// Drain a query result into JSON, capping at `max_rows`. When more rows exist

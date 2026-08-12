@@ -35,28 +35,29 @@ error_wrong_arg_count_http_200: PASS
 error_wrong_arg_count_is_tool_error: PASS
 error_wrong_arg_count_carries_engine_code: PASS
 error_wrong_arg_count_server_still_serving: PASS
-known_error_wrapped_in_driver_debug_format: PASS
+error_message_is_the_engine_sentence: PASS
+error_message_has_no_driver_wrapper: PASS
 known_division_by_zero_is_null_not_error: PASS
 guardrail_rejection_is_tool_error_over_200: PASS
 # --- read timeout ---
 SET GLOBAL vsql_mcp.query_timeout = 2;
 read_timeout_returns_an_error: PASS
 read_timeout_bounded: PASS
-known_read_timeout_message_is_not_the_intended_one: PASS
-known_read_timeout_surfaces_driver_internals: PASS
+read_timeout_says_what_happened: PASS
+read_timeout_exposes_no_driver_internals: PASS
 read_timeout_next_call_succeeds: PASS
 read_timeout_next_query_correct: PASS
-# --- expensive plan, not just SLEEP ---
-cross_join_timeout_returns_an_error: PASS
-cross_join_timeout_bounded: PASS
-cross_join_timeout_server_still_serving: PASS
+known_sleep_interrupted_but_statement_succeeds: PASS
+known_sleep_interrupt_is_bounded: PASS
 # --- write timeout: the call is bounded, the statement is not ---
 SET GLOBAL vsql_mcp.allow_write = ON;
 write_timeout_returns_an_error: PASS
 write_timeout_bounded_by_client_read_timeout: PASS
-known_write_timeout_message_is_not_the_intended_one: PASS
-known_write_timeout_reported_as_failure: PASS
-# the tool reported failure; wait for the abandoned UPDATE to land anyway
+write_timeout_says_outcome_is_unknown: PASS
+write_timeout_warns_it_may_still_commit: PASS
+write_timeout_does_not_claim_failure: PASS
+write_timeout_exposes_no_driver_internals: PASS
+# the tool reported the outcome as unknown; the UPDATE lands regardless
 SELECT COUNT(*) AS rows_written_after_reported_failure
 FROM mcpsec.t1 WHERE name = 'TIMEDOUT';
 rows_written_after_reported_failure

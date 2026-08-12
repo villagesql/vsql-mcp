@@ -53,11 +53,12 @@ def engine_errors():
         rows = C.query_rows(sid, "SELECT 1 AS alive")
         C.ok("error_%s_server_still_serving" % name, rows == [{"alive": 1}], rows)
 
-    # The driver's Debug formatting is passed through verbatim, so an agent
-    # reading the message sees a Rust wrapper around the sentence it wants.
+    # The engine's own sentence reaches the agent, with no driver wrapper
+    # around it. The exact text is captured from a real run.
     _, err = C.tool(sid, "query", {"sql": "SELECT * FROM mcpsec.nosuch"})
-    C.ok("known_error_wrapped_in_driver_debug_format",
-         err.startswith("MySqlError {") and err.endswith("}"), err[:120])
+    C.ok("error_message_is_the_engine_sentence",
+         err == "ERROR 1146 (42S02): Table 'mcpsec.nosuch' doesn't exist", err[:160])
+    C.ok("error_message_has_no_driver_wrapper", "MySqlError" not in err, err[:120])
 
     # Division by zero is NULL under MySQL's default sql_mode rather than an
     # error, so it is a successful result. Pinned so a later sql_mode change
@@ -74,26 +75,30 @@ def engine_errors():
 
 
 def read_timeout():
-    """query_timeout = 2 against a statement that sleeps for longer."""
+    """query_timeout = 2 against a plan that cannot finish in time.
+
+    Note this is an expensive plan rather than SLEEP: MAX_EXECUTION_TIME
+    interrupts SLEEP but the statement then SUCCEEDS, which is asserted at the
+    end of this function because an agent will meet it."""
     sid = C.init()
 
     started = time.time()
-    _, err = C.tool(sid, "query", {"sql": "SELECT SLEEP(30) AS s"}, timeout=120)
+    _, err = C.tool(sid, "query", {"sql":
+        "SELECT COUNT(*) AS c FROM information_schema.COLUMNS a, "
+        "information_schema.COLUMNS b, information_schema.COLUMNS c"}, timeout=120)
     elapsed = time.time() - started
 
     C.ok("read_timeout_returns_an_error", err != "", err[:120])
-    # Bounded well below the sleep, so the call really was cut short rather
-    # than waiting it out. Generous headroom keeps this stable on a loaded box.
-    C.ok("read_timeout_bounded", elapsed < 20, "%.1fs" % elapsed)
+    # Bounded well below the work the plan implies, so the call really was cut
+    # short. Generous headroom keeps this stable on a loaded box.
+    C.ok("read_timeout_bounded", elapsed < 30, "%.1fs" % elapsed)
 
-    # executor::map_err translates two timeout signatures into one clear
-    # sentence, but the driver reports a client read timeout as CodecError
-    # rather than IoError, so that branch never matches and the agent gets the
-    # driver's internal wording instead.
-    C.ok("known_read_timeout_message_is_not_the_intended_one",
-         TIMEOUT_MESSAGE not in err, err[:140])
-    C.ok("known_read_timeout_surfaces_driver_internals",
-         "CodecError" in err or "IO error" in err, err[:140])
+    # The client read timeout is given headroom over MAX_EXECUTION_TIME, so the
+    # server-side timer is the one that fires and the agent gets the sentence
+    # the extension wrote rather than a socket error from the driver.
+    C.ok("read_timeout_says_what_happened", err == TIMEOUT_MESSAGE, err[:140])
+    C.ok("read_timeout_exposes_no_driver_internals",
+         "CodecError" not in err and "os error" not in err, err[:140])
 
     # The connection is per call, so a timeout cannot poison the next one.
     rows = C.query_rows(sid, "SELECT 1 AS alive")
@@ -102,19 +107,16 @@ def read_timeout():
     C.ok("read_timeout_next_query_correct",
          obj is not None and obj["row_count"] == 3, obj)
 
-
-def cross_join_timeout():
-    """A genuinely expensive plan, rather than SLEEP, must also be cut off."""
-    sid = C.init()
+    # SLEEP is the exception, and it is worth knowing about: MAX_EXECUTION_TIME
+    # interrupts it, but SLEEP returns 1 rather than raising, so the statement
+    # succeeds. An agent timing something with SLEEP gets a successful result
+    # after query_timeout, not an error.
     started = time.time()
-    _, err = C.tool(sid, "query", {"sql":
-        "SELECT COUNT(*) AS c FROM information_schema.COLUMNS a, "
-        "information_schema.COLUMNS b, information_schema.COLUMNS c"}, timeout=120)
+    obj, err = C.jtool(sid, "query", {"sql": "SELECT SLEEP(30) AS s"}, timeout=120)
     elapsed = time.time() - started
-    C.ok("cross_join_timeout_returns_an_error", err != "", err[:120])
-    C.ok("cross_join_timeout_bounded", elapsed < 30, "%.1fs" % elapsed)
-    rows = C.query_rows(sid, "SELECT 1 AS alive")
-    C.ok("cross_join_timeout_server_still_serving", rows == [{"alive": 1}], rows)
+    C.ok("known_sleep_interrupted_but_statement_succeeds",
+         obj is not None and obj["rows"] == [{"s": 1}], obj or err)
+    C.ok("known_sleep_interrupt_is_bounded", elapsed < 20, "%.1fs" % elapsed)
 
 
 def write_timeout():
@@ -130,11 +132,18 @@ def write_timeout():
 
     C.ok("write_timeout_returns_an_error", err != "", err[:120])
     C.ok("write_timeout_bounded_by_client_read_timeout", elapsed < 20, "%.1fs" % elapsed)
-    C.ok("known_write_timeout_message_is_not_the_intended_one",
-         TIMEOUT_MESSAGE not in err, err[:140])
-    # The agent has been told the write failed. MTR checks the table next, and
-    # finds that it did not.
-    C.ok("known_write_timeout_reported_as_failure", err != "", err[:80])
+
+    # The statement is not killed — MAX_EXECUTION_TIME does not apply to a
+    # write — so only the client stopped waiting. The message must not claim
+    # the write failed, because MTR confirms below that it lands anyway. An
+    # agent that reads "unknown" can check; one that reads "failed" retries and
+    # double-applies.
+    C.ok("write_timeout_says_outcome_is_unknown", "outcome is unknown" in err, err[:200])
+    C.ok("write_timeout_warns_it_may_still_commit", "may still commit" in err, err[:200])
+    C.ok("write_timeout_does_not_claim_failure",
+         "failed" not in err.lower(), err[:200])
+    C.ok("write_timeout_exposes_no_driver_internals",
+         "CodecError" not in err and "os error" not in err, err[:140])
 
 
 def empty_states():
@@ -191,8 +200,9 @@ def not_configured():
         C.ok("db_url_denied_names_access_denied", "1045" in err, err[:160])
 
 
-{"engine": engine_errors, "read_timeout": read_timeout, "cross_join": cross_join_timeout,
- "write_timeout": write_timeout, "empty": empty_states, "not_configured": not_configured}[MODE]()
+{"engine": engine_errors, "read_timeout": read_timeout,
+ "write_timeout": write_timeout, "empty": empty_states,
+ "not_configured": not_configured}[MODE]()
 EOF
 
 --echo # --- engine errors surface as tool errors ---
@@ -202,13 +212,10 @@ EOF
 SET GLOBAL vsql_mcp.query_timeout = 2;
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port read_timeout
 
---echo # --- expensive plan, not just SLEEP ---
---exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port cross_join
-
 --echo # --- write timeout: the call is bounded, the statement is not ---
 SET GLOBAL vsql_mcp.allow_write = ON;
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port write_timeout
---echo # the tool reported failure; wait for the abandoned UPDATE to land anyway
+--echo # the tool reported the outcome as unknown; the UPDATE lands regardless
 let $wait_condition=
   SELECT COUNT(*) = 3 FROM mcpsec.t1 WHERE name = 'TIMEDOUT';
 --source include/wait_condition.inc

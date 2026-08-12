@@ -184,6 +184,10 @@ origin gets HTTP 403), as the MCP Streamable HTTP spec requires.
   with the privilege.
 - **`write`-tool statements have no server-side kill timeout.** `MAX_EXECUTION_TIME`
   applies to `SELECT`; `INSERT`/`UPDATE`/`DELETE` rely on the client read timeout.
+  When that fires the client stops waiting but the statement does not stop, so it
+  may still commit. The tool result says so rather than reporting failure: treat a
+  timed-out write as an unknown outcome and check before retrying, because a
+  non-idempotent statement can otherwise be applied twice.
 
 ## Security Considerations
 

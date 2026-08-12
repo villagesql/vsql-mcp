@@ -156,7 +156,11 @@ def maxrows():
 
 def timeout():
     sid = init()
-    _, err = tool(sid, "query", {"sql": "SELECT SLEEP(5)"})
+    # An expensive plan, not SLEEP: MAX_EXECUTION_TIME interrupts SLEEP but the
+    # statement then succeeds (SLEEP returns 1), so it cannot show a timeout.
+    _, err = tool(sid, "query", {"sql":
+        "SELECT COUNT(*) FROM information_schema.COLUMNS a, "
+        "information_schema.COLUMNS b, information_schema.COLUMNS c"})
     ok("query_timeout", err != "")
 
 def authfail():
