@@ -346,13 +346,21 @@ def authn():
     C.ok("auth_wrong_token_401", status({"Authorization": "Bearer wrong"}) == 401)
     C.ok("auth_empty_token_401", status({"Authorization": "Bearer "}) == 401)
     C.ok("auth_correct_token_200", status({"Authorization": "Bearer " + TOKEN}) == 200)
-    # The scheme is matched with a literal "Bearer " prefix, so it is
-    # case-sensitive and space-exact. RFC 7235 says the scheme is
-    # case-insensitive; this rejects a spec-legal client.
-    C.ok("known_auth_scheme_case_sensitive",
-         status({"Authorization": "bearer " + TOKEN}) == 401)
-    C.ok("known_auth_rejects_extra_space",
+    # RFC 7235 defines the auth scheme as case-insensitive, so a spec-legal
+    # client using a different case is accepted. The credential itself is not
+    # case-insensitive and an extra space makes it a different credential.
+    C.ok("auth_scheme_is_case_insensitive",
+         status({"Authorization": "bearer " + TOKEN}) == 200)
+    C.ok("auth_scheme_uppercase_accepted",
+         status({"Authorization": "BEARER " + TOKEN}) == 200)
+    C.ok("auth_rejects_extra_space",
          status({"Authorization": "Bearer  " + TOKEN}) == 401)
+    C.ok("auth_rejects_wrong_case_credential",
+         status({"Authorization": "Bearer " + TOKEN.upper()}) == 401)
+    C.ok("auth_rejects_other_scheme",
+         status({"Authorization": "Basic " + TOKEN}) == 401)
+    C.ok("auth_rejects_scheme_with_no_credential",
+         status({"Authorization": "Bearer"}) == 401)
     # A trailing space in the header value is not assertable from here: the HTTP
     # client strips it before it reaches the wire, so this would test urllib
     # rather than vsql_mcp. Leading space inside the credential is testable and
@@ -364,6 +372,20 @@ def authn():
     # GET is refused before auth is considered; 405 is the documented answer.
     st, _, _ = C.request(None, method="GET")
     C.ok("known_get_405_before_auth", st == 405, st)
+
+
+def no_token():
+    """require_auth ON with bearer_token empty. Accepting `Bearer ` here would
+    be the exact opposite of what the setting asks for."""
+    def status(hdrs):
+        st, _, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                             headers=hdrs)
+        return st
+
+    C.ok("no_token_refuses_empty_credential", status({"Authorization": "Bearer "}) == 401)
+    C.ok("no_token_refuses_bare_scheme", status({"Authorization": "Bearer"}) == 401)
+    C.ok("no_token_refuses_missing_header", status({}) == 401)
+    C.ok("no_token_refuses_any_credential", status({"Authorization": "Bearer guess"}) == 401)
 
 
 def origin():
@@ -492,7 +514,8 @@ def secrets():
 
 
 {"classify": classify, "layers": layers, "schema": schema_scope, "allowlist": allowlist,
- "scoped_allowlist": scoped_allowlist, "authn": authn, "origin": origin,
+ "scoped_allowlist": scoped_allowlist, "authn": authn, "no_token": no_token,
+ "origin": origin,
  "sessions": sessions, "write_off": write_off, "write_on": write_on,
  "secrets": secrets}[MODE]()
 EOF
@@ -529,6 +552,12 @@ SET GLOBAL vsql_mcp.bearer_token = 'tok3n-Value';
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port authn tok3n-Value
 SET GLOBAL vsql_mcp.require_auth = OFF;
 SET GLOBAL vsql_mcp.bearer_token = '';
+
+--echo # --- require_auth with no token configured refuses everything ---
+SET GLOBAL vsql_mcp.require_auth = ON;
+SET GLOBAL vsql_mcp.bearer_token = '';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port no_token
+SET GLOBAL vsql_mcp.require_auth = OFF;
 
 --echo # --- Origin validation (DNS rebinding defence) ---
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port origin

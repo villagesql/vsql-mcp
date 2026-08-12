@@ -159,13 +159,38 @@ fn origin_ok(req: &Request) -> bool {
     }
 }
 
+/// Compare two secrets without returning early on the first differing byte.
+/// The lengths are still distinguishable, which is inherent to comparing
+/// without hashing and is not what an attacker is fishing for here.
+fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn auth_ok(req: &Request, require_auth: bool, token: &str) -> bool {
     if !require_auth {
         return true;
     }
-    header(req, "Authorization")
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| t == token)
+    // Requiring auth against an unset token would let `Authorization: Bearer `
+    // through, which is the opposite of what the setting asks for.
+    if token.is_empty() {
+        return false;
+    }
+    let Some(value) = header(req, "Authorization") else {
+        return false;
+    };
+    let Some((scheme, credential)) = value.split_once(' ') else {
+        return false;
+    };
+    // RFC 7235 defines the scheme as case-insensitive; the credential is not.
+    scheme.eq_ignore_ascii_case("Bearer") && secret_eq(credential, token)
 }
 
 fn protocol_ok(req: &Request) -> bool {

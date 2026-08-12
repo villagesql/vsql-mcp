@@ -128,12 +128,24 @@ auth_missing_header_401: PASS
 auth_wrong_token_401: PASS
 auth_empty_token_401: PASS
 auth_correct_token_200: PASS
-known_auth_scheme_case_sensitive: PASS
-known_auth_rejects_extra_space: PASS
+auth_scheme_is_case_insensitive: PASS
+auth_scheme_uppercase_accepted: PASS
+auth_rejects_extra_space: PASS
+auth_rejects_wrong_case_credential: PASS
+auth_rejects_other_scheme: PASS
+auth_rejects_scheme_with_no_credential: PASS
 auth_enforced_on_delete: PASS
 known_get_405_before_auth: PASS
 SET GLOBAL vsql_mcp.require_auth = OFF;
 SET GLOBAL vsql_mcp.bearer_token = '';
+# --- require_auth with no token configured refuses everything ---
+SET GLOBAL vsql_mcp.require_auth = ON;
+SET GLOBAL vsql_mcp.bearer_token = '';
+no_token_refuses_empty_credential: PASS
+no_token_refuses_bare_scheme: PASS
+no_token_refuses_missing_header: PASS
+no_token_refuses_any_credential: PASS
+SET GLOBAL vsql_mcp.require_auth = OFF;
 # --- Origin validation (DNS rebinding defence) ---
 origin_rejects_https_evil_example: PASS
 origin_rejects_http_localhost_evil_com: PASS
