@@ -9,19 +9,8 @@ agents.
 
 It serves MCP over the **Streamable HTTP** transport (spec revision
 `2025-06-18`) on a listener owned by a background worker inside the server
-process.
-
-```sql
-INSTALL EXTENSION vsql_mcp;
-SET GLOBAL vsql_mcp.db_url = 'mysql://mcp_user:password@127.0.0.1:3306';
-SET GLOBAL vsql_mcp.schema = 'mydb';
-SET GLOBAL vsql_mcp.port = 3100;
-SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
-```
-
-```bash
-claude mcp add --transport http mydb http://localhost:3100/mcp
-```
+process. See [Quick start](#quick-start) to go from installing the extension to
+a connected agent.
 
 ## Requirements
 
@@ -61,7 +50,10 @@ nothing listens until you set `vsql_mcp.db_url` and turn
 
 ## Quick start
 
-Expose one schema and connect an agent to it:
+Expose one schema and connect an agent to it. Run this SQL in a MySQL client
+connected to your VillageSQL server as an administrator (for example
+`mysql -u root -h 127.0.0.1`); the server must already be running with preview
+extensions allowed (see [Requirements](#requirements)):
 
 ```sql
 INSTALL EXTENSION vsql_mcp;
@@ -77,21 +69,23 @@ SET GLOBAL vsql_mcp.bearer_token = 'a-long-random-token';
 SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
 ```
 
-The server now listens on `http://127.0.0.1:3100/mcp` (the default `port`).
-Point an MCP client at that URL with the bearer token — for Claude Code:
+The server now listens on `http://127.0.0.1:3100/mcp` (the default `port`). Then,
+in a terminal where your MCP client is installed, register that URL with the
+bearer token — for Claude Code:
 
 ```bash
 claude mcp add --transport http vsql http://127.0.0.1:3100/mcp \
   --header "Authorization: Bearer a-long-random-token"
 ```
 
-Any client that speaks MCP Streamable HTTP connects the same way — a URL plus an
-`Authorization: Bearer` header (Cursor, VS Code, Windsurf, and the OpenAI
-Responses API all support it). There is no stdio transport: the server runs
-inside the database, so there is no child process for a client to spawn. A
-stdio-only client, or a remote client that proxies through a vendor cloud (such
-as Claude Desktop's connectors, which cannot reach `127.0.0.1`), needs a generic
-stdio↔HTTP bridge or a tunnel in front of the endpoint.
+Your agent can now discover the schema and query it. Any client that speaks MCP
+Streamable HTTP connects the same way — a URL plus an `Authorization: Bearer`
+header (Cursor, VS Code, Windsurf, and the OpenAI Responses API all support it).
+There is no stdio transport: the server runs inside the database, so there is no
+child process for a client to spawn. A stdio-only client, or a remote client
+that proxies through a vendor cloud (such as Claude Desktop's connectors, which
+cannot reach `127.0.0.1`), needs a generic stdio↔HTTP bridge or a tunnel in
+front of the endpoint.
 
 ## How queries run
 
