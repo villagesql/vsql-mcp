@@ -59,6 +59,40 @@ The extension registers its configuration and status variables immediately;
 nothing listens until you set `vsql_mcp.db_url` and turn
 `vsql_mcp.vsql_mcp_enabled` ON.
 
+## Quick start
+
+Expose one schema and connect an agent to it:
+
+```sql
+INSTALL EXTENSION vsql_mcp;
+
+-- A dedicated least-privilege account the server runs tool queries as.
+CREATE USER 'mcp'@'127.0.0.1' IDENTIFIED BY 'change-me';
+GRANT SELECT ON mydb.* TO 'mcp'@'127.0.0.1';
+
+SET GLOBAL vsql_mcp.db_url = 'mysql://mcp:change-me@127.0.0.1:3306';
+SET GLOBAL vsql_mcp.schema = 'mydb';
+SET GLOBAL vsql_mcp.require_auth = ON;
+SET GLOBAL vsql_mcp.bearer_token = 'a-long-random-token';
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+```
+
+The server now listens on `http://127.0.0.1:3100/mcp` (the default `port`).
+Point an MCP client at that URL with the bearer token — for Claude Code:
+
+```bash
+claude mcp add --transport http vsql http://127.0.0.1:3100/mcp \
+  --header "Authorization: Bearer a-long-random-token"
+```
+
+Any client that speaks MCP Streamable HTTP connects the same way — a URL plus an
+`Authorization: Bearer` header (Cursor, VS Code, Windsurf, and the OpenAI
+Responses API all support it). There is no stdio transport: the server runs
+inside the database, so there is no child process for a client to spawn. A
+stdio-only client, or a remote client that proxies through a vendor cloud (such
+as Claude Desktop's connectors, which cannot reach `127.0.0.1`), needs a generic
+stdio↔HTTP bridge or a tunnel in front of the endpoint.
+
 ## How queries run
 
 The extension runs every tool query through a **loopback client connection** to
