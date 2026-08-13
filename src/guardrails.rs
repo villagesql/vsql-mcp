@@ -426,9 +426,33 @@ pub struct TableRef {
     pub alias: Option<String>,
 }
 
-/// Bare table names in table position. See [`table_refs`].
-pub fn table_refs_in_text(sql: &str) -> Vec<String> {
-    table_refs(sql).into_iter().map(|r| r.table).collect()
+/// The base tables an allowlist should check for `sql`, given its EXPLAIN plan.
+///
+/// `EXPLAIN FORMAT=JSON` reports the **alias** in `table_name`, not the base
+/// table — `FROM orders o` shows `table_name: "o"`. Checking those names
+/// directly is wrong in both directions: a legitimate aliased join of allowed
+/// tables is rejected (the alias is not on the list), and a forbidden table
+/// aliased as an allowed name is admitted (`secret AS customers` shows
+/// `customers`). So each EXPLAIN name is mapped back to the base table it
+/// aliases, using the alias→table pairs the statement text yields. A name that
+/// is not one of the statement's aliases is a real table — an unaliased table,
+/// or the underlying table a view exposed to the plan — and is kept as-is. When
+/// EXPLAIN named nothing (the optimizer answered without reading a table), the
+/// base tables from the text are used instead.
+pub fn tables_for_allowlist(sql: &str, explain: &Json) -> Vec<String> {
+    let refs = table_refs(sql);
+    let alias_to_base: std::collections::HashMap<String, String> = refs
+        .iter()
+        .filter_map(|r| r.alias.as_ref().map(|a| (a.clone(), r.table.clone())))
+        .collect();
+    let mut names = tables_in_explain(explain);
+    if names.is_empty() {
+        names = refs.into_iter().map(|r| r.table).collect();
+    }
+    names
+        .into_iter()
+        .map(|n| alias_to_base.get(&n).cloned().unwrap_or(n))
+        .collect()
 }
 
 /// Tables appearing in table position in the statement text: the identifier
@@ -436,11 +460,11 @@ pub fn table_refs_in_text(sql: &str) -> Vec<String> {
 /// qualifier dropped so the result matches what `EXPLAIN` reports, plus the
 /// alias bound to it.
 ///
-/// Two callers. The allowlist uses it as a fallback for the case where the
-/// optimizer answers without naming a table, so `tables_in_explain` cannot
-/// speak for what was touched. Schema scoping uses the names to tell a
-/// `schema.` qualifier apart from an alias or table qualifying one of its own
-/// columns.
+/// Two callers. The allowlist (via `tables_for_allowlist`) uses the alias→table
+/// pairs to map EXPLAIN's alias-named plan entries back to base tables, and the
+/// base names as a fallback when the optimizer answers without naming a table.
+/// Schema scoping uses the names to tell a `schema.` qualifier apart from an
+/// alias or a table qualifying one of its own columns.
 ///
 /// Deliberately eager on the table side: over-reporting a name costs a
 /// rejection, under-reporting one costs the allowlist.

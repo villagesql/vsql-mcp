@@ -2,7 +2,7 @@
 
 [package]
 name = "vsql_mcp"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 description = "VillageSQL extension: expose a database as a Model Context Protocol (MCP) server"
 license = "GPL-2.0"

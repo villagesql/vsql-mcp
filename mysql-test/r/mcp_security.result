@@ -97,6 +97,7 @@ allowlist_reject_direct: PASS
 allowlist_reject_subquery: PASS
 allowlist_reject_join: PASS
 allowlist_reject_derived_aliased_as_allowed: PASS
+allowlist_reject_table_aliased_as_allowed_name: PASS
 allowlist_reject_view_over_non_allowed: PASS
 allowlist_sees_through_view: PASS
 allowlist_reject_optimized_away_min_from_index: PASS
@@ -113,6 +114,7 @@ allowlist_permits_derived_table_over_allowed_table: PASS
 known_allowlist_matches_bare_name_across_schemas: PASS
 allowlist_permits_union_of_allowed_tables: PASS
 allowlist_rejects_union_reaching_excluded_table: PASS
+allowlist_permits_aliased_join_of_allowed_tables: PASS
 allowlist_permits_metadata_describe: PASS
 allowlist_permits_metadata_desc_abbreviated: PASS
 allowlist_permits_metadata_show_create: PASS

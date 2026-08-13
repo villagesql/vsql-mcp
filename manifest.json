@@ -1,6 +1,6 @@
 {
   "name": "vsql_mcp",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Expose a VillageSQL database as a Model Context Protocol (MCP) server",
   "author": "VillageSQL",
   "license": "GPL-2.0"

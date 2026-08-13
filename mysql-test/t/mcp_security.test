@@ -248,6 +248,10 @@ def allowlist():
             ("subquery", "SELECT (SELECT password_hash FROM mcpsec.secret LIMIT 1) AS x"),
             ("join", "SELECT s.password_hash FROM mcpsec.t1 JOIN mcpsec.secret s ON s.id=mcpsec.t1.id"),
             ("derived_aliased_as_allowed", "SELECT * FROM (SELECT password_hash FROM mcpsec.secret) AS t1"),
+            # EXPLAIN reports the alias in table_name, so aliasing the excluded
+            # table as an ALLOWED name once let this read `secret`. The alias is
+            # resolved back to the base table, so it must stay refused.
+            ("table_aliased_as_allowed_name", "SELECT password_hash FROM mcpsec.secret AS t1"),
             ("view_over_non_allowed", "SELECT * FROM mcpsec.v_secret")]:
         _, err = C.tool(sid, "query", {"sql": sql})
         C.rejected("allowlist_reject_" + name, err, "not in vsql_mcp.allowed_tables")
@@ -306,6 +310,15 @@ def allowlist():
         "SELECT name FROM mcpsec.t1 UNION SELECT password_hash FROM mcpsec.secret"})
     C.rejected("allowlist_rejects_union_reaching_excluded_table", err,
                "not in vsql_mcp.allowed_tables")
+
+    # A legitimate aliased join of allowed tables must be permitted. EXPLAIN
+    # names the aliases (`a`, `b`), which are resolved back to the base table
+    # before the allowlist is applied; without that, this common shape of
+    # agent-written SQL was rejected as `table 'a' is not in ...`.
+    rows = C.query_rows(sid,
+        "SELECT a.id FROM mcpsec.t1 a JOIN mcpsec.t1 b ON a.id = b.id ORDER BY a.id")
+    C.ok("allowlist_permits_aliased_join_of_allowed_tables",
+         rows == [{"id": 1}, {"id": 2}, {"id": 3}], rows)
 
     # SHOW and DESCRIBE cannot be planned with EXPLAIN, so their object is read
     # from the statement. The forms naming one table are checked against the

@@ -309,18 +309,15 @@ fn check_access(sql: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Res
             )),
         };
     }
+    // EXPLAIN reports aliases, not base tables, so the plan's names are resolved
+    // back through the statement text (see tables_for_allowlist). When the
+    // optimizer answers without reading a table — MIN()/MAX() from an index,
+    // "Impossible WHERE", LIMIT 0 — it names none, and the base tables from the
+    // text are used instead so an excluded table stays excluded; a statement
+    // that genuinely references nothing (SELECT 1) yields an empty list and is
+    // allowed.
     let plan = explain_json(sql, cfg, exec)?;
-    let mut tables = guardrails::tables_in_explain(&plan);
-    if tables.is_empty() {
-        // The optimizer can answer without reading any table — MIN()/MAX() from
-        // an index, "Impossible WHERE", LIMIT 0 — and then names none, so an
-        // empty list is "the plan cannot say", not "touches nothing". Falling
-        // back to the statement text keeps an excluded table excluded; a
-        // statement that genuinely references nothing (SELECT 1) still yields
-        // an empty list here and is allowed.
-        tables = guardrails::table_refs_in_text(sql);
-    }
-    for table in tables {
+    for table in guardrails::tables_for_allowlist(sql, &plan) {
         if !guardrails::table_allowed(&table, &cfg.allowed_tables) {
             return Err(format!("table '{table}' is not in vsql_mcp.allowed_tables"));
         }
