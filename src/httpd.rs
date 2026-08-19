@@ -309,7 +309,10 @@ fn protocol_ok(req: &Request) -> bool {
 }
 
 fn handle(request: Request) {
-    let path_ok = matches!(request.url().split('?').next(), Some("/mcp") | Some("/"));
+    let path_ok = matches!(
+        request.url().split('?').next(),
+        Some("/mcp") | Some("/mcp/") | Some("/")
+    );
     if !path_ok {
         respond_empty(request, 404);
         return;

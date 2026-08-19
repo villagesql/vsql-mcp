@@ -368,6 +368,9 @@ def transport():
                             headers={"Mcp-Session-Id": sid}, path="/")
     C.ok("transport_root_path_served", st == 200 and "result" in body, st)
     st, body, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                            headers={"Mcp-Session-Id": sid}, path="/mcp/")
+    C.ok("transport_trailing_slash_served", st == 200 and "result" in body, st)
+    st, body, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "ping"},
                             headers={"Mcp-Session-Id": sid}, path="/mcp?x=1")
     C.ok("transport_query_string_ignored", st == 200 and "result" in body, st)
 
