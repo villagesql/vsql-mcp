@@ -81,9 +81,19 @@ claude mcp add --transport http vsql http://127.0.0.1:3100/mcp \
 
 ### Codex
 
-Codex reads the token from an environment variable rather than from its config
-file, so export `VSQL_MCP_TOKEN` in the shell you start Codex from, then add the
-server to `~/.codex/config.toml`:
+```bash
+export VSQL_MCP_TOKEN=a-long-random-token
+codex mcp add vsql --url http://127.0.0.1:3100/mcp \
+  --bearer-token-env-var VSQL_MCP_TOKEN
+```
+
+`--bearer-token-env-var` takes the name of an environment variable, not the
+token itself. Codex reads that variable when it connects, so export it in the
+shell you start Codex from. Passing the token where the name belongs is accepted
+without complaint and the server then loads no tools.
+
+The command writes the server to `~/.codex/config.toml`, which you can edit
+directly instead:
 
 ```toml
 [mcp_servers.vsql]
