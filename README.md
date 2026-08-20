@@ -69,18 +69,63 @@ SET GLOBAL vsql_mcp.bearer_token = 'a-long-random-token';
 SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
 ```
 
-The server now listens on `http://127.0.0.1:3100/mcp` (the default `port`). Then,
-in a terminal where your MCP client is installed, register that URL with the
-bearer token — for Claude Code:
+The server now listens on `http://127.0.0.1:3100/mcp` (the default `port`).
+Register that URL and the bearer token with your client.
+
+### Claude Code
 
 ```bash
 claude mcp add --transport http vsql http://127.0.0.1:3100/mcp \
   --header "Authorization: Bearer a-long-random-token"
 ```
 
-Your agent can now discover the schema and query it. Any client that speaks MCP
-Streamable HTTP connects the same way — a URL plus an `Authorization: Bearer`
-header (Cursor, VS Code, Windsurf, and the OpenAI Responses API all support it).
+### Codex
+
+```bash
+export VSQL_MCP_TOKEN=a-long-random-token
+codex mcp add vsql --url http://127.0.0.1:3100/mcp \
+  --bearer-token-env-var VSQL_MCP_TOKEN
+```
+
+`--bearer-token-env-var` takes the name of an environment variable, not the
+token itself. Codex reads that variable when it connects, so export it in the
+shell you start Codex from. Passing the token where the name belongs is accepted
+without complaint and the server then loads no tools.
+
+The command writes the server to `~/.codex/config.toml`, which you can edit
+directly instead:
+
+```toml
+[mcp_servers.vsql]
+url = "http://127.0.0.1:3100/mcp"
+bearer_token_env_var = "VSQL_MCP_TOKEN"
+```
+
+Run `/mcp` in a Codex session to confirm the tools arrived.
+
+### Antigravity
+
+Add the server to `~/.gemini/config/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "vsql": {
+      "serverUrl": "http://127.0.0.1:3100/mcp",
+      "headers": { "Authorization": "Bearer a-long-random-token" }
+    }
+  }
+}
+```
+
+Antigravity names the endpoint field `serverUrl`, where most other clients call
+it `url`. Recent builds accept `url` too, but `serverUrl` is the documented
+field and the one every version reads.
+
+Your agent can now discover the schema and query it. Any other client that
+speaks MCP Streamable HTTP connects the same way — a URL plus an
+`Authorization: Bearer` header (Cursor, VS Code, Windsurf, and the OpenAI
+Responses API all support it).
 There is no stdio transport: the server runs inside the database, so there is no
 child process for a client to spawn. A stdio-only client, or a remote client
 that proxies through a vendor cloud (such as Claude Desktop's connectors, which

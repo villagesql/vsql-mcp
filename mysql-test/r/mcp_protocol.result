@@ -129,6 +129,7 @@ transport_get_405: PASS
 transport_put_405: PASS
 transport_unknown_path_404: PASS
 transport_root_path_served: PASS
+transport_trailing_slash_served: PASS
 transport_query_string_ignored: PASS
 known_transport_content_type_not_enforced: PASS
 known_transport_accept_not_enforced: PASS
