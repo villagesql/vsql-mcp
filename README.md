@@ -14,9 +14,9 @@ a connected agent.
 
 ## Requirements
 
-`vsql_mcp` uses the VEF preview capabilities `thread_worker`, `sys_var`, and
-`status_var` (the same set `vsql-rest` uses), so the server must be started with
-preview extensions allowed:
+`vsql_mcp` uses the VEF preview capabilities `thread_worker`, `sys_var`,
+`status_var`, and `sql_query`, so the server must be started with preview
+extensions allowed:
 
 ```bash
 mysqld --vsql_allow_preview_extensions=ON ...
@@ -45,8 +45,9 @@ INSTALL EXTENSION vsql_mcp;
 ```
 
 The extension registers its configuration and status variables immediately;
-nothing listens until you set `vsql_mcp.db_url` and turn
-`vsql_mcp.vsql_mcp_enabled` ON.
+nothing listens until you turn `vsql_mcp.vsql_mcp_enabled` ON.
+`vsql_mcp.db_url` is only needed for the `query` and `write` tools — see
+[How queries run](#how-queries-run).
 
 ## Quick start
 
@@ -134,14 +135,26 @@ front of the endpoint.
 
 ## How queries run
 
-The extension runs every tool query through a **loopback client connection** to
-the server, configured by `vsql_mcp.db_url`. Point that DSN at a dedicated MySQL
-account and tool calls run as that account under its real `GRANT`s — the
-allowlist and read-only enforcement below are defense in depth on top of the
-grants, not a replacement for them.
+Three of the six tools — `list_schemas`, `list_tables`, and `describe_table` —
+plus the `vsql://<schema>` resource listing run in-process, via the
+`sql_query` capability. Their column layout is fixed in the extension's own
+code, so no round trip is needed to name or type a result.
 
-A native in-process path will replace the loopback connection once the Rust SDK
-ports the `sql_query` capability (see [Known Limitations](#known-limitations)).
+Everything else — the `query` tool's arbitrary SQL, the `write` tool, EXPLAIN,
+and `SHOW CREATE TABLE` (behind the `vsql://<schema>/<table>` resource) — runs
+through a **loopback client connection** to the server, configured by
+`vsql_mcp.db_url`. `sql_query` cannot host these: as of this SDK version it
+reports no column names or types at all, so it cannot label an arbitrary
+query's result columns or `SHOW CREATE TABLE`'s `Create Table` column; and a
+session is only reachable from the worker thread that opened it, so it cannot
+host the `KILL`-based write timeout described in
+[Known Limitations](#known-limitations) either.
+
+Point `db_url` at a dedicated MySQL account and those tool calls run as that
+account under its real `GRANT`s — the allowlist and read-only enforcement
+below are defense in depth on top of the grants, not a replacement for them.
+`db_url` is still required if you use `query` or `write`; it is not required
+for schema/table browsing alone.
 
 ## Configuration
 
@@ -272,11 +285,12 @@ origin gets HTTP 403), as the MCP Streamable HTTP spec requires.
 
 ## Known Limitations
 
-- **SQL runs through a loopback connection.** The Rust SDK has not yet ported
-  the `sql_query` capability, so tool queries reach the database over a client
-  connection configured by `vsql_mcp.db_url` rather than in-process. Set
-  `db_url` to a dedicated account. A native path replaces this when `sql_query`
-  lands.
+- **Most SQL still runs through a loopback connection.** `sql_query` (as of
+  this SDK version) reports no column names or types, so it can only host the
+  three tools whose result shape is already fixed in this extension's own code
+  (see [How queries run](#how-queries-run)). `query`, `write`, `explain`, and
+  the table-DDL resource still reach the database over a client connection
+  configured by `vsql_mcp.db_url`. Set `db_url` to a dedicated account.
 - **Requires the SDK as a source dependency.** The published `villagesql` crate
   predates the preview capabilities this extension needs, so it builds against a
   local checkout of the Rust SDK until a crate version ships with them.

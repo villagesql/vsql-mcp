@@ -12,10 +12,11 @@ use std::time::Duration;
 
 use serde_json::Value as Json;
 use tiny_http::{Header, Method, Request, Response, Server};
+use villagesql::preview::thread_worker::ThreadHandle;
 
 use crate::config::{self, ListenConfig, RequestConfig};
-use crate::executor::Loopback;
-use crate::{mcp, status};
+use crate::executor::Hybrid;
+use crate::{mcp, status, SQL_QUERY};
 
 /// Largest request body accepted, so a client cannot stream an unbounded body
 /// into memory.
@@ -190,7 +191,7 @@ pub fn stop() {
 /// blocks here (a long tool call, or a stalled body read) delays disable and
 /// shutdown by exactly that long. The body read is bounded for this reason (see
 /// `read_body`); holding the lock only to collect keeps it off the critical path.
-pub fn poll() {
+pub fn poll(handle: &ThreadHandle) {
     let requests: Vec<Request> = {
         let guard = SERVERS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(servers) = guard.as_ref() else {
@@ -206,7 +207,7 @@ pub fn poll() {
     };
     for request in requests {
         // A panic while handling one request must not take down the worker.
-        let _ = catch_unwind(AssertUnwindSafe(|| handle(request)));
+        let _ = catch_unwind(AssertUnwindSafe(|| handle_request(request, handle)));
     }
 }
 
@@ -308,7 +309,7 @@ fn protocol_ok(req: &Request) -> bool {
     }
 }
 
-fn handle(request: Request) {
+fn handle_request(request: Request, handle: &ThreadHandle) {
     let path_ok = matches!(
         request.url().split('?').next(),
         Some("/mcp") | Some("/mcp/") | Some("/")
@@ -342,12 +343,12 @@ fn handle(request: Request) {
                 None => respond_empty(request, 400),
             }
         }
-        Method::Post => handle_post(request),
+        Method::Post => handle_post(request, handle),
         _ => respond_empty(request, 405),
     }
 }
 
-fn handle_post(request: Request) {
+fn handle_post(request: Request, handle: &ThreadHandle) {
     let cfg = RequestConfig::read();
     if !auth_ok(&request, cfg.require_auth, &cfg.bearer_token) {
         respond_empty(request, 401);
@@ -459,7 +460,11 @@ fn handle_post(request: Request) {
         Some(_) => {}
     }
 
-    let exec = Loopback::new(&cfg.db_url);
+    // Opened fresh per request, same connection-per-call philosophy as the
+    // loopback path (see `executor::Loopback`) — cheap since it's in-process,
+    // and it keeps every tool invocation independent.
+    let session = SQL_QUERY.open(handle);
+    let exec = Hybrid::new(&cfg.db_url, session.as_ref());
     let response = mcp::dispatch(method, params, &id, &cfg, &exec);
     respond_json(request, 200, &response);
 }

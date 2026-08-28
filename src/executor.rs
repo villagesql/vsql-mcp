@@ -1,11 +1,23 @@
 //! SQL execution seam.
 //!
-//! The extension cannot execute SQL in-process until the Rust SDK ports
-//! `vsql::preview::sql_query`, so v1 runs every tool query through a loopback
-//! client connection to the server's own listener, configured by
-//! `vsql_mcp.db_url`. All SQL execution goes through [`QueryExecutor`]; the
-//! loopback implementation is the only thing that changes when native
-//! `sql_query` lands.
+//! Two paths run tool queries, chosen per call by [`Hybrid`]:
+//!
+//! - Native, in-process, via `vsql::preview::sql_query` (see [`native`]): used
+//!   only for `read_params`, the fixed-shape internal introspection queries
+//!   whose select-list column order the caller already knows and gives back
+//!   as `columns` — `sql_query` never has to name a column for us.
+//! - Loopback, over `vsql_mcp.db_url` (see [`Loopback`]): used for everything
+//!   else — `read` (the `query` tool's arbitrary SQL), `read_text` (EXPLAIN,
+//!   but also `SHOW CREATE TABLE` for the `vsql://<schema>/<table>` resource,
+//!   which needs the server's real `Create Table` column name), and `write`.
+//!   `sql_query` cannot host any of these: it reports no column names or
+//!   types at all (a server-side gap; the command-service callback that has
+//!   this metadata discards it — see `villagesql/services/preview/sql_query.cc`),
+//!   so it can't reproduce typed or name-keyed output; and a session is only
+//!   reachable from the worker thread that opened it, so the KILL-based write
+//!   timeout below (the only way to bound a write — `MAX_EXECUTION_TIME` does
+//!   not apply to INSERT/UPDATE/DELETE) cannot be sent from a second
+//!   connection while that thread is busy running the statement.
 
 use std::fmt::Write as _;
 use std::io::ErrorKind;
@@ -22,6 +34,29 @@ pub struct Rows {
     pub truncated: bool,
 }
 
+/// One expected column of a `read_params` call, in select-list order. `numeric`
+/// tells the native path (see module docs) to parse the cell and emit a JSON
+/// number instead of a string, so a column that was a typed integer over the
+/// loopback path — `TABLE_ROWS`, say — renders the same way over either path.
+/// The loopback path ignores this: the driver already reports the real type.
+#[derive(Clone, Copy)]
+pub struct ColumnHint {
+    pub name: &'static str,
+    pub numeric: bool,
+}
+
+/// A text/enum column: rendered as a JSON string (or null), same as the
+/// loopback path already renders it.
+pub const fn col(name: &'static str) -> ColumnHint {
+    ColumnHint { name, numeric: false }
+}
+
+/// An integer column: rendered as a JSON number (or null) over the native
+/// path, matching what the loopback path's typed driver value already gives.
+pub const fn numeric_col(name: &'static str) -> ColumnHint {
+    ColumnHint { name, numeric: true }
+}
+
 pub trait QueryExecutor {
     /// Run a read-only statement, returning at most `max_rows` rows as JSON
     /// objects. Sets a read-only session and a statement timeout. Uses the
@@ -29,23 +64,33 @@ pub trait QueryExecutor {
     fn read(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String>;
 
     /// Run a read-only statement whose single string cell we want (EXPLAIN,
-    /// SHOW CREATE) — statements the binary/prepared protocol may reject. Uses
-    /// the text protocol, so callers must expect string cells.
+    /// SHOW CREATE) — statements the binary/prepared protocol may reject, and
+    /// (for SHOW CREATE) whose real column name (`Create Table`) the caller
+    /// needs. Uses the text protocol, so callers must expect string cells.
     fn read_text(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String>;
 
     /// Run a write statement, returning the affected-row count.
     fn write(&self, sql: &str, timeout_s: u64) -> Result<u64, String>;
 
-    /// Run a read-only statement with positional parameters (internal
-    /// schema-introspection queries), returning all rows.
-    fn read_params(&self, sql: &str, params: Vec<MyValue>, timeout_s: u64) -> Result<Rows, String>;
+    /// Run a read-only statement with positional parameters, returning all
+    /// rows keyed by `columns` — which the caller must give in the exact
+    /// order its `sql`'s select list names them, since the native path (see
+    /// module docs) cannot report the server's own names back.
+    fn read_params(
+        &self,
+        sql: &str,
+        params: Vec<MyValue>,
+        columns: &[ColumnHint],
+        timeout_s: u64,
+    ) -> Result<Rows, String>;
 }
 
-/// List every schema name the loopback account can see.
+/// List every schema name the account can see.
 pub fn schema_names(exec: &dyn QueryExecutor, timeout_s: u64) -> Result<Vec<String>, String> {
     let rows = exec.read_params(
         "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME",
         vec![],
+        &[col("SCHEMA_NAME")],
         timeout_s,
     )?;
     Ok(rows
@@ -61,6 +106,7 @@ pub fn schema_exists(exec: &dyn QueryExecutor, schema: &str, timeout_s: u64) -> 
     let rows = exec.read_params(
         "SELECT 1 AS present FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
         vec![MyValue::from(schema.to_owned())],
+        &[numeric_col("present")],
         timeout_s,
     )?;
     Ok(!rows.rows.is_empty())
@@ -76,6 +122,7 @@ pub fn tables_in_schema(
         "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS FROM information_schema.TABLES \
          WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
         vec![MyValue::from(schema.to_owned())],
+        &[col("TABLE_NAME"), col("TABLE_TYPE"), numeric_col("TABLE_ROWS")],
         timeout_s,
     )
 }
@@ -202,7 +249,16 @@ impl QueryExecutor for Loopback<'_> {
         Ok(conn.affected_rows())
     }
 
-    fn read_params(&self, sql: &str, params: Vec<MyValue>, timeout_s: u64) -> Result<Rows, String> {
+    fn read_params(
+        &self,
+        sql: &str,
+        params: Vec<MyValue>,
+        _columns: &[ColumnHint],
+        timeout_s: u64,
+    ) -> Result<Rows, String> {
+        // The driver reports the server's real column names for every row, so
+        // the caller-given `columns` (needed by the native path; see module
+        // docs) is redundant here and ignored.
         let mut conn = self.read_conn(timeout_s, None)?;
         let result = conn.exec_iter(sql, params).map_err(map_err)?;
         collect(result, usize::MAX)
@@ -408,4 +464,171 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// The in-process execution path, backed by an open `vsql::preview::sql_query`
+/// session. See the module docs for what this can and cannot host.
+mod native {
+    use serde_json::{Map, Value as Json};
+    use villagesql::preview::sql_query::{Diag, Session};
+
+    use super::{ColumnHint, Rows};
+
+    /// `MAX_EXECUTION_TIME` interrupting a statement — the same numeric error
+    /// the loopback path already matches on, for the same reason (see
+    /// `map_err` above).
+    const ER_QUERY_INTERRUPTED: u32 = 3024;
+
+    fn describe(diag: &Diag) -> String {
+        format!("ERROR {} ({}): {}", diag.errno, diag.sqlstate, diag.message)
+    }
+
+    fn map_err(diag: Diag) -> String {
+        if diag.errno == ER_QUERY_INTERRUPTED {
+            return "statement exceeded vsql_mcp.query_timeout".to_owned();
+        }
+        describe(&diag)
+    }
+
+    /// Run one setup statement (session mode, timeout) that must succeed
+    /// before the real query runs.
+    fn run_admin(session: &Session, sql: &str) -> Result<(), String> {
+        let result = session
+            .execute(sql)
+            .ok_or_else(|| "sql_query: could not open a session-setup statement".to_owned())?;
+        match result.error() {
+            Some(diag) => Err(describe(&diag)),
+            None => Ok(()),
+        }
+    }
+
+    /// Put the session into the same read-only, timeout-bounded state the
+    /// loopback path sets up per connection (see `Loopback::read_conn`).
+    fn set_read_only(session: &Session, timeout_s: u64) -> Result<(), String> {
+        run_admin(session, "SET SESSION TRANSACTION READ ONLY")?;
+        run_admin(
+            session,
+            &format!("SET SESSION MAX_EXECUTION_TIME = {}", timeout_s.saturating_mul(1000)),
+        )
+    }
+
+    /// Substitute each `?` in `sql` with `params[i]` rendered as an escaped SQL
+    /// literal. `sql_query` takes only raw text (villagesql-server#627 tracks
+    /// giving it real bind values); this is the one place in the extension
+    /// that has to do the escaping by hand, and it does so with the same
+    /// driver (`mysql::Value::as_sql`) the loopback path already trusts to
+    /// quote a literal correctly.
+    fn bind(sql: &str, params: &[super::MyValue]) -> Result<String, String> {
+        let mut parts = sql.split('?');
+        let mut out = parts
+            .next()
+            .ok_or_else(|| "empty statement".to_owned())?
+            .to_owned();
+        for (part, param) in parts.zip(params) {
+            out.push_str(&param.as_sql(true));
+            out.push_str(part);
+        }
+        // One fewer `?` than params, or vice versa, means the caller's
+        // placeholder count doesn't match — a bug in this extension's own
+        // code, not something a live server round trip would ever surface.
+        if sql.matches('?').count() != params.len() {
+            return Err(format!(
+                "sql_query: {} placeholder(s) in statement but {} parameter(s) given",
+                sql.matches('?').count(),
+                params.len()
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Run a statement with positional parameters, keying every row with
+    /// `columns` in position order (see `QueryExecutor::read_params`).
+    pub fn read_params(
+        session: &Session,
+        sql: &str,
+        params: Vec<super::MyValue>,
+        columns: &[ColumnHint],
+        timeout_s: u64,
+    ) -> Result<Rows, String> {
+        let bound = bind(sql, &params)?;
+        set_read_only(session, timeout_s)?;
+        let mut result = session
+            .execute(&bound)
+            .ok_or_else(|| "sql_query: could not open the statement".to_owned())?;
+        if let Some(diag) = result.error() {
+            return Err(map_err(diag));
+        }
+        let mut rows = Vec::new();
+        while let Some(row) = result.next_row() {
+            let mut obj = Map::with_capacity(columns.len());
+            for (i, hint) in columns.iter().enumerate() {
+                let cell = row.get_str(i as u32);
+                let value = match (cell, hint.numeric) {
+                    (None, _) => Json::Null,
+                    (Some(s), true) => s
+                        .trim()
+                        .parse::<i64>()
+                        .map_or(Json::Null, Json::from),
+                    (Some(s), false) => Json::String(s.to_owned()),
+                };
+                obj.insert(hint.name.to_owned(), value);
+            }
+            rows.push(Json::Object(obj));
+        }
+        Ok(Rows {
+            columns: columns.iter().map(|h| h.name.to_owned()).collect(),
+            rows,
+            truncated: false,
+        })
+    }
+}
+
+/// Routes each `QueryExecutor` method to whichever path can host it — see the
+/// module docs. `native` is `None` when the capability is unavailable (preview
+/// extensions off, or an SDK build predating `sql_query`), in which case every
+/// method falls back to the loopback connection exactly as before.
+pub struct Hybrid<'a> {
+    loopback: Loopback<'a>,
+    // `SQL_QUERY` is a `static`, so every `Session` it opens is `Session<'static>`
+    // regardless of how long the borrow held here lasts.
+    native: Option<&'a villagesql::preview::sql_query::Session<'static>>,
+}
+
+impl<'a> Hybrid<'a> {
+    pub fn new(
+        db_url: &'a str,
+        native: Option<&'a villagesql::preview::sql_query::Session<'static>>,
+    ) -> Self {
+        Self {
+            loopback: Loopback::new(db_url),
+            native,
+        }
+    }
+}
+
+impl QueryExecutor for Hybrid<'_> {
+    fn read(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String> {
+        self.loopback.read(sql, max_rows, timeout_s)
+    }
+
+    fn read_text(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String> {
+        self.loopback.read_text(sql, max_rows, timeout_s)
+    }
+
+    fn write(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
+        self.loopback.write(sql, timeout_s)
+    }
+
+    fn read_params(
+        &self,
+        sql: &str,
+        params: Vec<MyValue>,
+        columns: &[ColumnHint],
+        timeout_s: u64,
+    ) -> Result<Rows, String> {
+        match self.native {
+            Some(session) => native::read_params(session, sql, params, columns, timeout_s),
+            None => self.loopback.read_params(sql, params, columns, timeout_s),
+        }
+    }
 }

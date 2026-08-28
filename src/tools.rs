@@ -9,7 +9,7 @@ use mysql::Value as MyValue;
 use serde_json::{json, Value as Json};
 
 use crate::config::RequestConfig;
-use crate::executor::{self, QueryExecutor};
+use crate::executor::{self, col, QueryExecutor};
 use crate::guardrails::{self, StmtKind};
 use crate::{mcp, status};
 
@@ -197,6 +197,14 @@ fn describe_table(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) ->
          FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
          ORDER BY ORDINAL_POSITION",
         vec![MyValue::from(schema.clone()), MyValue::from(table.to_owned())],
+        &[
+            col("COLUMN_NAME"),
+            col("COLUMN_TYPE"),
+            col("IS_NULLABLE"),
+            col("COLUMN_KEY"),
+            col("COLUMN_DEFAULT"),
+            col("COLUMN_COMMENT"),
+        ],
         cfg.query_timeout,
     )?;
     if rows.rows.is_empty() {
