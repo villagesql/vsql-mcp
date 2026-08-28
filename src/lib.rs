@@ -1,8 +1,8 @@
 // vsql-mcp — expose a VillageSQL database as a Model Context Protocol server.
 // Copyright (C) 2026 VillageSQL. Licensed under GPL-2.0.
 
-//! Entry point: wires the three preview capabilities (thread_worker, sys_var,
-//! status_var) to the MCP HTTP server and registers the `info()` VDF.
+//! Entry point: wires the four preview capabilities (thread_worker, sys_var,
+//! status_var, sql_query) to the MCP HTTP server and registers the `info()` VDF.
 //!
 //! The background worker owns the listener lifecycle. On enable it binds the
 //! configured ports; on each periodic wakeup it drains pending HTTP requests;
@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
+use villagesql::preview::sql_query::SqlQueryCapability;
 use villagesql::preview::thread_worker::{
     NextWakeup, ThreadHandle, ThreadWorkerCapability, WakeupReason,
 };
@@ -44,7 +45,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The background worker. Runs on the server's worker thread whenever
 /// `vsql_mcp.vsql_mcp_enabled` is ON.
-fn worker(reason: WakeupReason, _handle: ThreadHandle) -> NextWakeup {
+fn worker(reason: WakeupReason, handle: &ThreadHandle) -> NextWakeup {
     match reason {
         WakeupReason::Enable => {
             // Defer the actual bind: see PENDING_START above. No get(), no bind.
@@ -66,7 +67,7 @@ fn worker(reason: WakeupReason, _handle: ThreadHandle) -> NextWakeup {
                 let bound = httpd::start(&cfg);
                 ENABLED.store(bound, Ordering::Relaxed);
             }
-            httpd::poll();
+            httpd::poll(handle);
         }
         WakeupReason::Disable => {
             PENDING_START.store(false, Ordering::Relaxed);
@@ -81,6 +82,15 @@ fn worker(reason: WakeupReason, _handle: ThreadHandle) -> NextWakeup {
 /// `vsql_mcp.vsql_mcp_enabled`, matching the extension's configuration surface.
 static WORKER: ThreadWorkerCapability =
     ThreadWorkerCapability::new(worker, "vsql_mcp", POLL_INTERVAL, None);
+
+/// The `sql_query` capability. `httpd::handle_post` opens a session on it per
+/// request for the tool calls that can run in-process — see `executor::Hybrid`.
+/// `query` and `write` still go through the loopback connection in
+/// `vsql_mcp.db_url`: `sql_query` (as of this SDK version) reports no column
+/// names or types, so it cannot reproduce the query tool's typed, name-keyed
+/// output, and a session cannot be reached from outside the worker thread that
+/// opened it, so it cannot host the KILL-based write timeout either.
+pub(crate) static SQL_QUERY: SqlQueryCapability = SqlQueryCapability::new();
 
 /// SQL: `vsql_mcp.info()` -> STRING (JSON). A liveness probe callable without a
 /// database, so tests can assert server state without an HTTP round-trip.
@@ -107,5 +117,6 @@ villagesql::extension! {
         &WORKER,
         &config::SYS_VAR,
         &status::STATUS_VAR,
+        &SQL_QUERY,
     ]
 }
