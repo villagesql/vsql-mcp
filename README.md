@@ -27,8 +27,9 @@ the next server start.
 
 ## Building
 
-Requires the [VillageSQL Rust SDK](https://github.com/villagesql/vsql-rust-sdk)
-and `cargo-vsql` (`cargo install cargo-vsql`), plus a Rust toolchain 1.87+.
+Requires `cargo-vsql` (`cargo install cargo-vsql`) and a Rust toolchain 1.87+.
+The [VillageSQL Rust SDK](https://github.com/villagesql/vsql-rust-sdk) comes
+from crates.io.
 
 ```bash
 export VillageSQL_BUILD_DIR=/path/to/villagesql/build
@@ -291,9 +292,6 @@ origin gets HTTP 403), as the MCP Streamable HTTP spec requires.
   (see [How queries run](#how-queries-run)). `query`, `write`, `explain`, and
   the table-DDL resource still reach the database over a client connection
   configured by `vsql_mcp.db_url`. Set `db_url` to a dedicated account.
-- **Requires the SDK as a source dependency.** The published `villagesql` crate
-  predates the preview capabilities this extension needs, so it builds against a
-  local checkout of the Rust SDK until a crate version ships with them.
 - **No SSE / server-initiated messages.** `GET /mcp` returns HTTP 405, which the
   spec allows for servers without a stream; there are no progress notifications.
 - **Requests are handled one at a time.** The worker drains and serves requests

@@ -12,7 +12,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-villagesql = { path = "../vsql-rust-sdk/villagesql" }
+villagesql = "0.0.6"
 serde_json = "1"
 tiny_http = { version = "0.12", features = ["ssl-rustls"] }
 # Already in the tree via tiny_http's ssl-rustls feature; named directly so the
