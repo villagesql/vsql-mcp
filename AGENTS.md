@@ -22,10 +22,6 @@ cargo vsql test --record    # regenerate expected results
 The server must run with `--vsql_allow_preview_extensions=ON` (the test suite
 sets this via `mysql-test/t/mcp_basic-master.opt`).
 
-The `villagesql` dependency is a local path to the Rust SDK checkout, because the
-published crate predates the preview capabilities this extension uses. Keep it a
-path dependency until a crate version ships those capabilities.
-
 ## Layout
 
 | Path | Role |

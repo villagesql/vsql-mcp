@@ -976,7 +976,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "villagesql"
-version = "0.0.1"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c21944d8c8e25e34e4b245fe88ad0045a742052dfb41ce5a45f7aa4c62d9e3"
 dependencies = [
  "paste",
  "villagesql-sys",
@@ -984,7 +986,9 @@ dependencies = [
 
 [[package]]
 name = "villagesql-sys"
-version = "0.0.1"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98540ee00ef154d1f46d328b1839e027e79e13f5c78fa2f2548173a99b118015"
 
 [[package]]
 name = "vsql_mcp"
