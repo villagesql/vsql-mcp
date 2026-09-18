@@ -15,15 +15,22 @@ a connected agent.
 ## Requirements
 
 `vsql_mcp` uses the VEF preview capabilities `thread_worker`, `sys_var`,
-`status_var`, and `sql_query`, so the server must be started with preview
-extensions allowed:
+`status_var`, and `sql_query`, so the server must allow preview extensions:
 
 ```bash
 mysqld --vsql_allow_preview_extensions=ON ...
 ```
 
-`SET PERSIST vsql_allow_preview_extensions = ON` also works and takes effect for
-the next server start.
+On a running server, `SET PERSIST vsql_allow_preview_extensions = ON` takes
+effect at once: the next `INSTALL EXTENSION` succeeds, with no restart.
+`SET GLOBAL` is rejected, because the server requires the setting to survive a
+restart.
+
+Without preview extensions allowed, the install fails:
+
+```
+ERROR 3219 (HY000): Failed to load VEF extension 'vsql_mcp': extension requires preview capabilities but vsql_allow_preview_extensions is OFF
+```
 
 ## Building
 
@@ -32,12 +39,24 @@ The [VillageSQL Rust SDK](https://github.com/villagesql/vsql-rust-sdk) comes
 from crates.io.
 
 ```bash
+cargo vsql package
+```
+
+That compiles in release mode and writes `dist/vsql_mcp.veb`. Copy the bundle
+into the directory the server loads extensions from. Ask the server which
+directory that is:
+
+```sql
+SHOW VARIABLES LIKE 'veb_dir';
+```
+
+`cargo vsql install` packages and installs into a server build tree, if you
+have one:
+
+```bash
 export VillageSQL_BUILD_DIR=/path/to/villagesql/build
 cargo vsql install
 ```
-
-`cargo vsql install` compiles in release mode, packages `dist/vsql_mcp.veb`, and
-copies it into the server's VEB directory.
 
 ## Installing
 
@@ -49,6 +68,11 @@ The extension registers its configuration and status variables immediately;
 nothing listens until you turn `vsql_mcp.vsql_mcp_enabled` ON.
 `vsql_mcp.db_url` is only needed for the `query` and `write` tools — see
 [How queries run](#how-queries-run).
+
+`UNINSTALL EXTENSION vsql_mcp` takes those variables away again, and with them
+every value you gave them, including values set with `SET PERSIST`. A reinstall
+therefore starts from the defaults in [Configuration](#configuration), and the
+configuration has to be applied again.
 
 ## Quick start
 
@@ -201,7 +225,12 @@ agent never plans around a tool it cannot use.
 
 Tool results follow the MCP shape: a `content` array with a JSON text block,
 plus `isError`. A rejected statement returns `isError: true` with a message
-naming the guardrail that stopped it.
+naming the guardrail that stopped it. An `UPDATE` sent to the `query` tool is
+refused with:
+
+```
+only a single read-only statement is allowed by the query tool
+```
 
 ### Guardrails
 
@@ -330,6 +359,76 @@ as a security boundary:
   proxy that maps identities over the single static token.
 - `allowed_tables` and `schema` narrow what an agent can reach even within the
   account's grants.
+
+## Adding a tool
+
+The tool surface lives in `src/tools.rs`. `tool_definitions()` holds the
+definition of every tool, `list()` decides which of them an agent sees, and
+`call()` routes a tool name to its handler. A tool of your own is one
+definition, one match arm, and one function.
+
+Add the definition to `tool_definitions()`:
+
+```rust
+{
+    "name": "list_indexes",
+    "description": "Indexes on a table, one row per indexed column.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "schema": { "type": "string" },
+            "table": { "type": "string" }
+        },
+        "required": ["table"]
+    }
+},
+```
+
+Route the name in `call()`:
+
+```rust
+"list_indexes" => list_indexes(args, cfg, exec),
+```
+
+Then write the handler, which receives the call arguments, the live
+configuration, and the executor:
+
+```rust
+fn list_indexes(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String>
+```
+
+`describe_table` is the closest handler to copy, and the helpers it uses are
+available to any handler:
+
+- `guardrails::table_allowed` applies the operator's `allowed_tables` list.
+- `effective_schema` returns the configured schema when `vsql_mcp.schema` is
+  set, and the caller's `schema` argument when it is not.
+- `exec.read_params` runs a statement with positional parameters. Give it the
+  result columns in the order the select list names them, because the
+  in-process path cannot read the server's own column names back. It uses that
+  in-process path through `sql_query` where the capability is available, and
+  the `db_url` connection where it is not.
+- `exec.read()` runs arbitrary SQL, always over the `db_url` connection.
+
+Build the new bundle and copy it into `veb_dir`:
+
+```bash
+cargo vsql package
+```
+
+Then reload the extension. No server restart is involved:
+
+```sql
+UNINSTALL EXTENSION vsql_mcp;
+INSTALL EXTENSION vsql_mcp;
+```
+
+The next `tools/list` includes your tool. The reinstall also returns every
+`vsql_mcp.*` setting to its default, so apply the configuration again.
+
+The `mcp_basic`, `mcp_protocol`, and `mcp_security` tests assert the exact tool
+list, so a new tool has to be named in them too. Bump the version in
+`manifest.json` and `Cargo.toml` together for any behavior change.
 
 ## Testing
 
