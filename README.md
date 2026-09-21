@@ -64,7 +64,7 @@ INSTALL EXTENSION vsql_mcp;
 CREATE USER 'mcp'@'127.0.0.1' IDENTIFIED BY 'change-me';
 GRANT SELECT ON mydb.* TO 'mcp'@'127.0.0.1';
 
-SET GLOBAL vsql_mcp.db_url = 'mysql://mcp:change-me@127.0.0.1:3306';
+SET GLOBAL vsql_mcp.db_url = 'mysql://mcp:change-me@127.0.0.1:3306/mydb';
 SET GLOBAL vsql_mcp.schema = 'mydb';
 SET GLOBAL vsql_mcp.require_auth = ON;
 SET GLOBAL vsql_mcp.bearer_token = 'a-long-random-token';
