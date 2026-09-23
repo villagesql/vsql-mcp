@@ -25,7 +25,7 @@ const DEFAULT_SESSION_TTL: i64 = 1800;
 /// `thread_worker` capability owns that control variable.
 static SPECS: &[SysVarSpec] = &[
     SysVarSpec::Int { name: c"port", comment: c"HTTP listen port (0 = OS-assigned)", default: DEFAULT_PORT, min: 0, max: 65535, on_change: None },
-    SysVarSpec::Int { name: c"ssl_port", comment: c"HTTPS listen port (0 = disabled)", default: DEFAULT_SSL_PORT, min: 0, max: 65535, on_change: None },
+    SysVarSpec::Int { name: c"ssl_port", comment: c"HTTPS listen port (0 = OS-assigned)", default: DEFAULT_SSL_PORT, min: 0, max: 65535, on_change: None },
     SysVarSpec::Str { name: c"ssl_cert", comment: c"Path to the TLS certificate (PEM)", default: c"", on_change: None },
     SysVarSpec::Str { name: c"ssl_key", comment: c"Path to the TLS private key (PEM)", default: c"", on_change: None },
     SysVarSpec::Str { name: c"schema", comment: c"Schema to expose (empty = all non-system schemas)", default: c"", on_change: None },
