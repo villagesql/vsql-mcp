@@ -5,7 +5,9 @@ reviewers:
   - leeca-vsql
   - robgolebiowski-vsql
   - villagestevers
+  - villagedominic
 
 # GitHub usernames of people who may apply /approve
 approvers:
   - villagestevers
+  - villagedominic
