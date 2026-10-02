@@ -34,7 +34,7 @@ ERROR 3219 (HY000): Failed to load VEF extension 'vsql_mcp': extension requires 
 
 ## Building
 
-Requires `cargo-vsql` (`cargo install cargo-vsql`) and a Rust toolchain 1.87+.
+Requires `cargo-vsql` (`cargo install cargo-vsql`) and a Rust toolchain 1.88+.
 The [VillageSQL Rust SDK](https://github.com/villagesql/vsql-rust-sdk) comes
 from crates.io.
 
@@ -311,7 +311,10 @@ origin gets HTTP 403), as the MCP Streamable HTTP spec requires.
 | `vsql_mcp.rows_returned_total` | Rows returned by the `query` tool |
 | `vsql_mcp.http_port` / `vsql_mcp.https_port` | Actually-bound ports (0 = not listening) |
 
-`SELECT vsql_mcp.info();` returns the same liveness summary as JSON.
+`SELECT vsql_mcp.info();` returns the same liveness summary as JSON. The
+worker tries to bind the listener on its next wakeup, which comes every 25 ms,
+so a call right after `vsql_mcp_enabled` is set can report `"starting": true`
+with `"enabled": false`.
 
 ## Known Limitations
 
