@@ -98,6 +98,9 @@ fn info_impl(_args: &[InValue]) -> VdfReturn {
     let (port, ssl_port) = config::port_settings();
     let summary = json!({
         "enabled": ENABLED.load(Ordering::Relaxed),
+        // True between `vsql_mcp_enabled = ON` and the bind attempt on the next
+        // Periodic wakeup, so a caller can tell "not up yet" from "off".
+        "starting": PENDING_START.load(Ordering::Relaxed),
         "port": port,
         "ssl_port": ssl_port,
         "http_port": status::http_port(),

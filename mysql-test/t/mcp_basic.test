@@ -41,7 +41,8 @@ let $port= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VA
 # per-run, so only the "> 0" fact is printed. The VDF returns a binary-charset
 # string (the VEF default), so JSON functions need an explicit CONVERT.
 SELECT JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.enabled') AS info_enabled,
-       JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.http_port') > 0 AS info_http_port_bound;
+       JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.http_port') > 0 AS info_http_port_bound,
+       JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.starting') AS info_starting;
 
 --write_file $MYSQLTEST_VARDIR/tmp/mcp_driver.py
 import sys, json, urllib.request, urllib.error
@@ -275,7 +276,8 @@ SELECT VARIABLE_VALUE AS sessions_active
 
 # info() reflects the stop: not enabled, no bound port.
 SELECT JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.enabled') AS info_enabled_after_stop,
-       JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.http_port') AS info_http_port_after_stop;
+       JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.http_port') AS info_http_port_after_stop,
+       JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.starting') AS info_starting_after_stop;
 
 --remove_file $MYSQLTEST_VARDIR/tmp/mcp_driver.py
 DROP SCHEMA mcptest;
