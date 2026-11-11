@@ -250,6 +250,10 @@ Applied to every `query`, `explain`, and `write` call:
   name does not resolve. Aliases and table-qualified columns work normally —
   `p.total` is a column, not a schema.
 
+  A `SHOW` statement with `FROM` or `IN`, `SHOW CREATE DATABASE`, and a `SHOW`
+  statement that lists every schema (`SHOW DATABASES`, `SHOW OPEN TABLES`) are
+  rejected. Use the `list_tables` and `describe_table` tools instead.
+
   Scoping reads the statement, so a view inside the exposed schema that selects
   from another one is reachable through it, as SQL intends for a view. Use
   `allowed_tables` when you need confinement that holds through a view: that

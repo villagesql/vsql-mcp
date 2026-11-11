@@ -226,6 +226,24 @@ def schema_scope():
     C.rejected("schema_rejects_table_aliased_to_its_own_schema", err,
                "outside the exposed schema")
 
+    # SHOW can name a schema with no qualifier, or list every schema. Each of
+    # these returned mcpalt's names, or every schema's, before this check.
+    for name, sql in [
+            ("tables_from", "SHOW TABLES FROM mcpalt"),
+            ("tables_in", "SHOW TABLES IN mcpalt"),
+            ("columns_db", "SHOW COLUMNS FROM t1 FROM mcpalt"),
+            ("index_db", "SHOW INDEX FROM t1 IN mcpalt"),
+            ("create_database", "SHOW CREATE DATABASE mcpalt"),
+            ("databases", "SHOW DATABASES"),
+            ("procedure_status", "SHOW PROCEDURE STATUS"),
+            ("open_tables", "SHOW OPEN TABLES"),
+            ("exec_comment", "SHOW TABLES /*!FROM mcpalt*/"),
+            ("exec_comment_version", "SHOW /*!40000 DATABASES */")]:
+        _, err = C.tool(sid, "query", {"sql": sql})
+        C.rejected("schema_reject_show_" + name, err, "can read outside the exposed schema")
+    rows = C.query_rows(sid, "SHOW CREATE TABLE mcpsec.t1")
+    C.ok("schema_allows_qualified_show_create", bool(rows), rows)
+
     # The rejection says what to do instead. The loopback session has no default
     # database, so dropping the qualifier is not the answer.
     _, err = C.tool(sid, "query", {"sql": "SELECT tag FROM mcpalt.t1"})

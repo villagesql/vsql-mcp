@@ -130,6 +130,26 @@ pub fn metadata_target(sql: &str) -> Option<MetadataTarget> {
     }
 }
 
+/// True for a `SHOW` statement that can read outside one schema without a
+/// `schema.` qualifier, which `schema_violation` would catch. `FROM` or `IN`
+/// can name any schema (`SHOW TABLES FROM otherdb`), `SHOW CREATE DATABASE`
+/// names one directly, and the rest list every schema at once.
+pub fn show_outside_schema(sql: &str) -> bool {
+    let idents: Vec<String> = idents_outside_strings(sql)
+        .into_iter()
+        .map(|w| w.to_ascii_lowercase())
+        .collect();
+    let w: Vec<&str> = idents.iter().map(String::as_str).collect();
+    match w.as_slice() {
+        ["show", "databases" | "schemas", ..]
+        | ["show", "create", "database" | "schema", ..]
+        | ["show", "procedure" | "function", "status", ..]
+        | ["show", "open", "tables", ..] => true,
+        ["show", rest @ ..] => rest.iter().any(|w| *w == "from" || *w == "in"),
+        _ => false,
+    }
+}
+
 /// Take the next name and keep the table half, matching how the allowlist
 /// matches. `idents_outside_strings` emits `db.t` as one token, so the
 /// qualifier is still visible here.
@@ -386,6 +406,12 @@ fn qualified_refs(sql: &str) -> Vec<(String, String)> {
 /// index of the next byte that is neither. Used wherever MySQL allows a gap
 /// that must not change how a reference reads.
 ///
+/// An executable comment (`/*!mcpalt*/`, `/*!80000 mcpalt */`) is not a gap:
+/// the server runs the text inside it. Only its markers are skipped, so the
+/// scanners read the text as if it had no comment around it. A version that
+/// is newer than the server makes the server ignore the text; reading it anyway
+/// costs at most a needless rejection.
+///
 /// Works on bytes throughout. The scanners that call this walk unrecognized
 /// bytes one at a time, so `start` can land in the middle of a multibyte UTF-8
 /// sequence (a Unicode identifier, which MySQL allows); slicing the `str` there
@@ -397,7 +423,14 @@ fn skip_gap(sql: &str, start: usize) -> usize {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        if bytes[i..].starts_with(b"/*") {
+        if bytes[i..].starts_with(b"/*!") {
+            i += 3;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else if bytes[i..].starts_with(b"*/") {
+            i += 2;
+        } else if bytes[i..].starts_with(b"/*") {
             match find_bytes(&bytes[i + 2..], b"*/") {
                 Some(end) => i = i + 2 + end + 2,
                 None => return bytes.len(),

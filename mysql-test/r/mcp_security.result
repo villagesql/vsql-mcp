@@ -86,6 +86,17 @@ schema_allows_table_qualified_column: PASS
 schema_allows_self_join_with_aliases: PASS
 schema_rejects_foreign_function_call: PASS
 schema_rejects_table_aliased_to_its_own_schema: PASS
+schema_reject_show_tables_from: PASS
+schema_reject_show_tables_in: PASS
+schema_reject_show_columns_db: PASS
+schema_reject_show_index_db: PASS
+schema_reject_show_create_database: PASS
+schema_reject_show_databases: PASS
+schema_reject_show_procedure_status: PASS
+schema_reject_show_open_tables: PASS
+schema_reject_show_exec_comment: PASS
+schema_reject_show_exec_comment_version: PASS
+schema_allows_qualified_show_create: PASS
 schema_rejection_names_the_exposed_schema: PASS
 schema_rejection_says_to_qualify: PASS
 known_unqualified_name_has_no_default_db: PASS

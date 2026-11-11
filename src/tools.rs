@@ -293,6 +293,14 @@ fn check_access(sql: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Res
             cfg.schema
         ));
     }
+    if !cfg.schema.is_empty() && guardrails::show_outside_schema(sql) {
+        return Err(format!(
+            "this SHOW statement can read outside the exposed schema '{}', so it \
+             cannot be used while vsql_mcp.schema is set; use the list_schemas, \
+             list_tables and describe_table tools instead",
+            cfg.schema
+        ));
+    }
     if cfg.allowed_tables.is_empty() {
         return Ok(());
     }
