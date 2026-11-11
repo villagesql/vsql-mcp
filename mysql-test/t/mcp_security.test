@@ -226,13 +226,29 @@ def schema_scope():
     C.rejected("schema_rejects_table_aliased_to_its_own_schema", err,
                "outside the exposed schema")
 
-    # The rejection says what to do instead. The loopback session has no default
-    # database, so dropping the qualifier is not the answer.
+    # The rejection says what to do instead. The exposed schema is the loopback
+    # session's default database, so dropping the qualifier is the answer.
     _, err = C.tool(sid, "query", {"sql": "SELECT tag FROM mcpalt.t1"})
     C.ok("schema_rejection_names_the_exposed_schema", "only 'mcpsec' is available" in err, err[:180])
-    C.ok("schema_rejection_says_to_qualify", "must be qualified" in err, err[:180])
-    _, err = C.tool(sid, "query", {"sql": "SELECT name FROM t1 WHERE id=1"})
-    C.ok("known_unqualified_name_has_no_default_db", "1046" in err, err[:140])
+    C.ok("schema_rejection_says_bare_names_work", "bare table name resolves" in err, err[:180])
+    rows = C.query_rows(sid, "SELECT name FROM t1 WHERE id=1")
+    C.ok("schema_unqualified_name_resolves_in_exposed_schema", rows == [{"name": "alpha"}], rows)
+
+
+def schema_overrides_db_url():
+    """vsql_mcp.schema = mcpsec, and db_url names mcpalt as its database. A bare
+    name must still resolve in mcpsec: mcpalt.t1 has no `name` column, so a
+    bare name sent to mcpalt fails, and it would get past the schema check."""
+    sid = C.init()
+    rows = C.query_rows(sid, "SELECT name FROM t1 WHERE id=1")
+    C.ok("schema_replaces_db_url_database", rows == [{"name": "alpha"}], rows)
+
+
+def schema_missing():
+    """vsql_mcp.schema names a schema that does not exist."""
+    sid = C.init()
+    _, err = C.tool(sid, "query", {"sql": "SELECT 1 AS a"})
+    C.rejected("schema_missing_is_named", err, "vsql_mcp.schema 'mcp_nosuch' does not exist")
 
 
 def allowlist():
@@ -621,7 +637,9 @@ def secrets():
          joined[:160])
 
 
-{"classify": classify, "layers": layers, "schema": schema_scope, "allowlist": allowlist,
+{"classify": classify, "layers": layers, "schema": schema_scope,
+ "schema_overrides_db_url": schema_overrides_db_url, "schema_missing": schema_missing,
+ "allowlist": allowlist,
  "scoped_allowlist": scoped_allowlist, "authn": authn, "no_token": no_token,
  "session_expiry": session_expiry,
  "origin": origin,
@@ -643,6 +661,15 @@ SELECT COUNT(*) AS evil_tables FROM information_schema.TABLES
 --echo # --- schema scoping ---
 SET GLOBAL vsql_mcp.schema = 'mcpsec';
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port schema
+--disable_query_log
+--eval SET GLOBAL vsql_mcp.db_url = CONCAT('mysql://mcpuser@127.0.0.1:', @@port, '/mcpalt')
+--enable_query_log
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port schema_overrides_db_url
+--disable_query_log
+--eval SET GLOBAL vsql_mcp.db_url = CONCAT('mysql://mcpuser@127.0.0.1:', @@port)
+--enable_query_log
+SET GLOBAL vsql_mcp.schema = 'mcp_nosuch';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port schema_missing
 SET GLOBAL vsql_mcp.schema = '';
 
 --echo # --- table allowlist ---

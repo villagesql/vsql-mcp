@@ -464,7 +464,7 @@ fn handle_post(request: Request, handle: &ThreadHandle) {
     // loopback path (see `executor::Loopback`) — cheap since it's in-process,
     // and it keeps every tool invocation independent.
     let session = SQL_QUERY.open(handle);
-    let exec = Hybrid::new(&cfg.db_url, session.as_ref());
+    let exec = Hybrid::new(&cfg.db_url, &cfg.schema, session.as_ref());
     let response = mcp::dispatch(method, params, &id, &cfg, &exec);
     respond_json(request, 200, &response);
 }

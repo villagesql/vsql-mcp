@@ -87,8 +87,11 @@ schema_allows_self_join_with_aliases: PASS
 schema_rejects_foreign_function_call: PASS
 schema_rejects_table_aliased_to_its_own_schema: PASS
 schema_rejection_names_the_exposed_schema: PASS
-schema_rejection_says_to_qualify: PASS
-known_unqualified_name_has_no_default_db: PASS
+schema_rejection_says_bare_names_work: PASS
+schema_unqualified_name_resolves_in_exposed_schema: PASS
+schema_replaces_db_url_database: PASS
+SET GLOBAL vsql_mcp.schema = 'mcp_nosuch';
+schema_missing_is_named: PASS
 SET GLOBAL vsql_mcp.schema = '';
 # --- table allowlist ---
 SET GLOBAL vsql_mcp.allowed_tables = 't1';

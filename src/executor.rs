@@ -132,11 +132,12 @@ pub fn tables_in_schema(
 /// requests serially, so there is no connection contention to pool around.
 pub struct Loopback<'a> {
     url: &'a str,
+    schema: &'a str,
 }
 
 impl<'a> Loopback<'a> {
-    pub fn new(url: &'a str) -> Self {
-        Self { url }
+    pub fn new(url: &'a str, schema: &'a str) -> Self {
+        Self { url, schema }
     }
 
     fn connect(&self, timeout_s: u64) -> Result<Conn, String> {
@@ -147,7 +148,19 @@ impl<'a> Loopback<'a> {
         let opts = OptsBuilder::from_opts(opts)
             .read_timeout(Some(Duration::from_secs(timeout_s)))
             .write_timeout(Some(Duration::from_secs(timeout_s)));
-        Conn::new(opts).map_err(|e| format!("loopback connect failed: {e}"))
+        if self.schema.is_empty() {
+            return Conn::new(opts).map_err(|e| format!("loopback connect failed: {e}"));
+        }
+        // The exposed schema is the session's default database, so a bare table
+        // name resolves inside it. It replaces any database named in `db_url`:
+        // `guardrails::schema_violation` checks only qualified names, and a
+        // default pointing elsewhere would send bare names past it.
+        Conn::new(opts.db_name(Some(self.schema))).map_err(|e| match &e {
+            mysql::Error::MySqlError(db) if db.code == ER_BAD_DB_ERROR => {
+                format!("vsql_mcp.schema '{}' does not exist", self.schema)
+            }
+            _ => format!("loopback connect failed: {e}"),
+        })
     }
 
     /// Open a read-only session with a statement timeout and, optionally, a
@@ -206,7 +219,10 @@ impl Loopback<'_> {
             let Ok(opts) = Opts::from_url(&url) else {
                 return;
             };
+            // No default database: `KILL QUERY` needs none, and a database in
+            // `db_url` that does not exist would make this connect fail.
             let opts = OptsBuilder::from_opts(opts)
+                .db_name(None::<String>)
                 .read_timeout(Some(Duration::from_secs(KILL_TIMEOUT_S)))
                 .write_timeout(Some(Duration::from_secs(KILL_TIMEOUT_S)));
             if let Ok(mut killer) = Conn::new(opts) {
@@ -353,6 +369,9 @@ fn map_write_err(e: mysql::Error) -> String {
 
 /// `ER_QUERY_INTERRUPTED` — what a killed statement reports.
 const ER_QUERY_INTERRUPTED: u16 = 1317;
+
+/// `ER_BAD_DB_ERROR` — what a connect to a missing default database reports.
+const ER_BAD_DB_ERROR: u16 = 1049;
 
 /// Drain a query result into JSON, capping at `max_rows`. When more rows exist
 /// than the cap, `truncated` is set and the surplus is consumed and discarded.
@@ -597,10 +616,11 @@ pub struct Hybrid<'a> {
 impl<'a> Hybrid<'a> {
     pub fn new(
         db_url: &'a str,
+        schema: &'a str,
         native: Option<&'a villagesql::preview::sql_query::Session<'static>>,
     ) -> Self {
         Self {
-            loopback: Loopback::new(db_url),
+            loopback: Loopback::new(db_url, schema),
             native,
         }
     }

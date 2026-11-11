@@ -270,9 +270,9 @@ fn has_trailing_statement(sql: &str) -> bool {
 }
 
 /// When a schema is configured, reject any `schema.` qualifier that names a
-/// different schema. Table names must be qualified with the configured schema:
-/// the loopback session has no default database, so an unqualified name does
-/// not resolve.
+/// different schema. An unqualified name needs no check: the loopback session's
+/// default database is the configured schema (see `Loopback::connect`), so the
+/// name resolves inside it.
 ///
 /// Not every `x.y` is a schema reference. `p.name` qualifies a column with a
 /// table alias and `t1.id` with a table, and reading those as schemas made
