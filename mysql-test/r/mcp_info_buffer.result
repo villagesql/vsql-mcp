@@ -1,0 +1,18 @@
+INSTALL EXTENSION vsql_mcp;
+SET GLOBAL vsql_mcp.port = 0;
+SET GLOBAL vsql_mcp.schema = REPEAT('a', 1000);
+SELECT LENGTH(CONVERT(vsql_mcp.info() USING utf8mb4)) > 1024 AS info_json_exceeds_old_buffer,
+JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.enabled') AS info_enabled,
+LENGTH(JSON_UNQUOTE(JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.schema'))) AS info_schema_len;
+info_json_exceeds_old_buffer	info_enabled	info_schema_len
+1	false	1000
+SET GLOBAL vsql_mcp.schema = REPEAT('"', 1000);
+SELECT JSON_UNQUOTE(JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.schema')) = REPEAT('"', 1000) AS info_quotes_whole;
+info_quotes_whole
+1
+SET GLOBAL vsql_mcp.schema = REPEAT(CHAR(1), 200);
+SELECT JSON_UNQUOTE(JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.schema')) = REPEAT(CHAR(1), 200) AS info_control_bytes_whole;
+info_control_bytes_whole
+1
+SET GLOBAL vsql_mcp.schema = '';
+UNINSTALL EXTENSION vsql_mcp;

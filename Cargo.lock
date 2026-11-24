@@ -894,7 +894,7 @@ checksum = "64e8b9e4d2ecc638b0af6c0d3cfea7f282373ad9c441bd5dd9f89c6b96c62a55"
 
 [[package]]
 name = "vsql_mcp"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "base64",
  "mysql",

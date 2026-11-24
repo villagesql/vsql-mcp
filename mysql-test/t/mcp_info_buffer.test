@@ -1,0 +1,41 @@
+# vsql_mcp — info() sizes its result buffer from vsql_mcp.schema.
+#
+# info()'s JSON embeds vsql_mcp.schema, a free-form sys var with no SDK-enforced
+# length limit. The VDF used to declare a fixed buffer_size:512; the server
+# rounds any declared buffer_size up to its 1024-byte allocation quantum
+# (villagesql/vdf/vdf_handler.cc, RoundUpResultBuffer), so the old effective
+# buffer was actually 1024 bytes, not 512 -- but the ceiling is still fixed. A
+# schema value long enough to push the JSON past that raised "result of N
+# bytes exceeds the 1024-byte buffer" instead of describing server state --
+# breaking the one VDF documented as callable "without a database" for
+# exactly the troubleshooting moment it exists for. info() now sizes its
+# buffer from a prerun hook instead, so there is no fixed ceiling to outgrow.
+#
+# Every field but schema is a bool, a small int, or the fixed protocol-version
+# string, under 150 bytes together, so a 1000-byte schema value alone pushes
+# the JSON to roughly 1.1 KB -- past the old 1024-byte effective buffer with
+# margin, and well within what the prerun now requests (JSON-escaped schema length + 256,
+# itself then rounded up by the same server-side allocator).
+
+INSTALL EXTENSION vsql_mcp;
+
+SET GLOBAL vsql_mcp.port = 0;
+SET GLOBAL vsql_mcp.schema = REPEAT('a', 1000);
+
+# info() still succeeds, the JSON is bigger than the old effective buffer
+# would allow, and the schema value comes back whole.
+SELECT LENGTH(CONVERT(vsql_mcp.info() USING utf8mb4)) > 1024 AS info_json_exceeds_old_buffer,
+       JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.enabled') AS info_enabled,
+       LENGTH(JSON_UNQUOTE(JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.schema'))) AS info_schema_len;
+
+# JSON escaping makes the output longer than the setting: each '"' becomes
+# two bytes and each control byte six (\u0001), so the buffer has to be sized
+# from the escaped form, not the raw length.
+SET GLOBAL vsql_mcp.schema = REPEAT('"', 1000);
+SELECT JSON_UNQUOTE(JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.schema')) = REPEAT('"', 1000) AS info_quotes_whole;
+
+SET GLOBAL vsql_mcp.schema = REPEAT(CHAR(1), 200);
+SELECT JSON_UNQUOTE(JSON_EXTRACT(CONVERT(vsql_mcp.info() USING utf8mb4), '$.schema')) = REPEAT(CHAR(1), 200) AS info_control_bytes_whole;
+
+SET GLOBAL vsql_mcp.schema = '';
+UNINSTALL EXTENSION vsql_mcp;
